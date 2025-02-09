@@ -1,0 +1,35 @@
+mod network;
+mod protocol;
+mod storage;
+mod handler;
+
+use anyhow::Result;
+use tracing::{info, Level};
+use tracing_subscriber::fmt::format::FmtSpan;
+use crate::storage::MessageStore;
+use crate::handler::Handler;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize logging with more detail
+    tracing_subscriber::fmt()
+        .with_max_level(Level::TRACE)
+        .with_span_events(FmtSpan::CLOSE)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_file(true)
+        .with_line_number(true)
+        .init();
+
+    info!("Starting KafkaHouse broker...");
+    
+    // Initialize the message store
+    let message_store = MessageStore::new("http://localhost:8123")?;
+    let handler = Handler::new(message_store);
+    
+    // Start the Kafka protocol server
+    let addr = "127.0.0.1:9092";
+    network::run_server(addr, handler).await?;
+
+    Ok(())
+} 
