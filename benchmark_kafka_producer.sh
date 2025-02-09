@@ -18,9 +18,9 @@ fi
 # Configuration
 BROKER="127.0.0.1:9092"
 TOPIC="test_topic"
-MESSAGE_SIZE=100      # Size of each message in bytes
-NUM_MESSAGES=100000   # Number of messages to send
-BATCH_SIZE=1000      # Messages per batch
+MESSAGE_SIZE=1000     # Size of each message in bytes
+NUM_MESSAGES=1000000  # Number of messages to send
+BATCH_SIZE=10000     # Messages per batch
 THROUGHPUT=-1        # -1 means no throttling
 
 echo "Starting Kafka producer performance test..."
@@ -42,6 +42,7 @@ echo
     --producer-props bootstrap.servers=$BROKER \
                      batch.size=$BATCH_SIZE \
                      linger.ms=0 \
+                     max.in.flight.requests.per.connection=5 \
                      acks=1 \
                      client.id=perf-producer-client
 

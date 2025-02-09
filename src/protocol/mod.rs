@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use bytes::{BytesMut, Buf, BufMut};
 use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use kafka_protocol::messages::{ApiKey, ResponseHeader, ApiVersionsResponse};
 use kafka_protocol::protocol::Encodable;
 use kafka_protocol::protocol::StrBytes;
@@ -18,7 +18,10 @@ pub struct KafkaRequest {
     pub payload: Vec<u8>,
 }
 
-pub async fn read_request(stream: &mut TcpStream) -> Result<KafkaRequest> {
+pub async fn read_request<R>(stream: &mut R) -> Result<KafkaRequest> 
+where
+    R: AsyncRead + Unpin,
+{
     // First read the size
     let mut size_buf = [0u8; 4];
     stream.read_exact(&mut size_buf).await?;
@@ -71,12 +74,15 @@ pub async fn read_request(stream: &mut TcpStream) -> Result<KafkaRequest> {
     })
 }
 
-pub async fn write_api_versions_response(
-    stream: &mut TcpStream,
+pub async fn write_api_versions_response<W>(
+    stream: &mut W,
     response: &ApiVersionsResponse,
     version: i16,
     correlation_id: i32
-) -> Result<()> {
+) -> Result<()> 
+where
+    W: AsyncWrite + Unpin,
+{
     let mut buf = BytesMut::new();
     
     // Write response header (correlation_id: int32)
@@ -115,12 +121,15 @@ pub async fn write_api_versions_response(
     Ok(())
 }
 
-pub async fn write_response<T: Encodable>(
-    stream: &mut TcpStream,
+pub async fn write_response<W, T: Encodable>(
+    stream: &mut W,
     response: &T,
     version: i16,
     correlation_id: i32
-) -> Result<()> {
+) -> Result<()> 
+where
+    W: AsyncWrite + Unpin,
+{
     let mut buf = BytesMut::new();
     
     // Write response header (correlation_id: int32)
