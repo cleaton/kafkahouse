@@ -40,9 +40,6 @@ echo
     --record-size $MESSAGE_SIZE \
     --throughput $THROUGHPUT \
     --producer-props bootstrap.servers=$BROKER \
-                     batch.size=$BATCH_SIZE \
-                     linger.ms=0 \
-                     max.in.flight.requests.per.connection=5 \
                      acks=1 \
                      client.id=perf-producer-client
 

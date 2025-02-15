@@ -1,115 +1,122 @@
 use anyhow::Result;
 use clickhouse::{Client, Row};
 use serde::Serialize;
-use std::time::Duration;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client as HyperClient;
-use hyper_util::rt::TokioExecutor;
-use futures::future::join_all;
-
-const INSERT_BATCH_SIZE: usize = 10_000;
-const MAX_EXECUTION_TIME: u64 = 60;
-const POOL_MAX_IDLE: usize = 32;
-const POOL_IDLE_TIMEOUT_MS: u64 = 2_500;
+use tracing::info;
+use std::time::Instant;
+use tokio::sync::{mpsc, oneshot};
+use std::thread;
 
 #[derive(Row, Serialize)]
 struct Message {
     topic: String,
     partition: u32,
     data: String,
-    offset: u64,
 }
 
-// TODO: Implement message storage in ClickHouse
+type MessageBatch = (String, u32, Vec<String>);
+
+struct InsertRequest {
+    batches: Vec<MessageBatch>,
+    response: oneshot::Sender<Result<u64>>,
+}
+
 pub struct MessageStore {
-    client: Client,
+    sender: mpsc::Sender<InsertRequest>,
 }
 
 impl MessageStore {
     pub fn new(url: &str) -> Result<Self> {
-        // Configure HTTP client with connection pooling
-        let connector = HttpConnector::new();
-        let hyper_client = HyperClient::builder(TokioExecutor::new())
-            .pool_idle_timeout(Duration::from_millis(POOL_IDLE_TIMEOUT_MS))
-            .pool_max_idle_per_host(POOL_MAX_IDLE)
-            .build(connector);
-
-        // Configure ClickHouse client
-        let client = Client::with_http_client(hyper_client)
+        let (sender, mut receiver) = mpsc::channel::<InsertRequest>(1000);
+        let client = Client::default()
             .with_url(url)
             .with_option("async_insert", "1")
-            .with_option("wait_for_async_insert", "0")
-            .with_option("async_insert_busy_timeout_ms", "500")
-            .with_option("max_insert_block_size", "10000")
-            .with_option("min_insert_block_size_rows", "10000")
-            .with_option("min_insert_block_size_bytes", "100000")
-            .with_option("max_execution_time", MAX_EXECUTION_TIME.to_string())
-            .with_option("max_threads", "8")
-            .with_option("max_insert_threads", "8")
-            .with_option("max_compress_block_size", "1048576");
+            .with_option("wait_for_async_insert", "1");
 
-        Ok(Self { client })
+        // Spawn the worker task
+        tokio::spawn(async move {
+            let mut pending_requests = Vec::new();
+            
+            while let Some(first_request) = receiver.recv().await {
+                // Got first request, now collect all pending requests without waiting
+                pending_requests.push(first_request);
+                
+                // Drain the channel
+                while let Ok(request) = receiver.try_recv() {
+                    pending_requests.push(request);
+                }
+
+                let start = Instant::now();
+                let request_count = pending_requests.len();
+
+                // Collect all batches into a single vec
+                let all_batches: Vec<MessageBatch> = pending_requests
+                    .iter()
+                    .flat_map(|req| req.batches.iter().cloned())
+                    .collect();
+
+                // Process all batches in one insert
+                let result = Self::process_insert(&client, all_batches).await;
+
+                // Send result to all waiting requests
+                if let Ok(count) = result.as_ref() {
+                    let duration = start.elapsed();
+                    info!(
+                        thread_id = ?thread::current().id(),
+                        request_count = request_count,
+                        "Inserted {} messages in {:?}, {} messages/sec, {} requests",
+                        count,
+                        duration,
+                        *count as f64 / duration.as_secs_f64(),
+                        request_count
+                    );
+                }
+
+                // Send responses
+                for request in pending_requests.drain(..) {
+                    let individual_count = request.batches.iter()
+                        .map(|(_, _, msgs)| msgs.len() as u64)
+                        .sum();
+                    let _ = request.response.send(result.as_ref().map(|_| individual_count).map_err(|e| anyhow::anyhow!(e.to_string())));
+                }
+            }
+        });
+
+        Ok(Self { sender })
     }
 
-    pub async fn append_message(&self, topic: &str, partition: u32, data: &str) -> Result<u64> {
-        let mut insert = self.client.insert("messages")?;
-        
-        insert.write(&Message { 
-            topic: topic.to_string(), 
-            partition, 
-            data: data.to_string(),
-            offset: 0,
-        }).await?;
-        
-        insert.end().await?;
-        Ok(0)
-    }
+    async fn process_insert(client: &Client, batches: Vec<MessageBatch>) -> Result<u64> {
+        let total_size: usize = batches.iter().map(|(_, _, msgs)| msgs.len()).sum();
+        let mut messages = Vec::with_capacity(total_size);
 
-    pub async fn append_messages(&self, topic: &str, partition: u32, data: Vec<String>) -> Result<u64> {
-        let mut insert = self.client.insert("messages")?;
-        
-        for msg in data {
-            insert.write(&Message { 
-                topic: topic.to_string(), 
-                partition, 
-                data: msg,
-                offset: 0,
-            }).await?;
-        }
-        
-        insert.end().await?;
-        Ok(0)
-    }
-
-    pub async fn append_message_batches(&self, batches: Vec<(String, u32, Vec<String>)>) -> Result<u64> {
-        let mut total_messages = 0;
-        let mut insert = self.client.insert("messages")?;
-        
-        for (topic, partition, messages) in batches {
-            let topic = topic.clone(); // Clone once per batch instead of per message
-            for msg in messages {
-                insert.write(&Message {
+        // Convert batches into Message structs
+        for (topic, partition, batch_messages) in batches {
+            for msg in batch_messages {
+                messages.push(Message {
                     topic: topic.clone(),
                     partition,
                     data: msg,
-                    offset: total_messages,
-                }).await?;
-                total_messages += 1;
+                });
             }
         }
-        
+
+        // Create a single insert operation and write all messages
+        let mut insert = client.insert("messages")?;
+        for msg in messages {
+            insert.write(&msg).await?;
+        }
         insert.end().await?;
-        Ok(total_messages as u64)
+
+        Ok(total_size as u64)
     }
 
-    pub async fn get_message(&self, topic: &str, partition: u32, offset: u64) -> Result<Option<String>> {
-        let mut cursor = self.client
-            .query("SELECT data FROM messages WHERE topic = ? AND partition = ? AND offset = ?")
-            .bind(topic)
-            .bind(partition)
-            .bind(offset)
-            .fetch::<String>()?;
+    pub async fn append_message_batches(&self, batches: Vec<MessageBatch>) -> Result<u64> {
+        let (response_tx, response_rx) = oneshot::channel();
+        
+        self.sender.send(InsertRequest {
+            batches,
+            response: response_tx,
+        }).await.map_err(|_| anyhow::anyhow!("Worker task terminated"))?;
 
-        Ok(cursor.next().await?)
+        response_rx.await.map_err(|_| anyhow::anyhow!("Worker task terminated"))?
     }
 } 

@@ -6,7 +6,7 @@ edition = "2018"
 [dependencies]
 tokio = { version = "1.28", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
 bytes = "1.0"
 futures = "0.3"
@@ -17,3 +17,10 @@ serde = { version = "1.0.217", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio"] }
 hyper = { version = "1.1", features = ["client", "http1"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "storage_benchmark"
+harness = false

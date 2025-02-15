@@ -73,9 +73,27 @@ impl Handler {
             response.throttle_time_ms = 0;
         }
 
+        info!("Produce request config: acks={}, timeout_ms={}", 
+              request.acks, request.timeout_ms);
+
         let mut topic_responses = Vec::new();
         let mut all_batches = Vec::new();
         let current_offset: i64 = 0;  // Removed mut since it's not modified
+
+        // Count total messages across all topics/partitions
+        let mut total_messages = 0;
+        for topic_data in &request.topic_data {
+            for partition_data in &topic_data.partition_data {
+                if let Some(ref records) = partition_data.records {
+                    let mut records_buf = Bytes::from(records.to_vec());
+                    if let Ok(decoded_records) = RecordBatchDecoder::decode::<_, fn(&mut Bytes, _) -> _>(&mut records_buf) {
+                        total_messages += decoded_records.len();
+                    }
+                }
+            }
+        }
+        info!("Received produce request with {} messages across {} topics", 
+              total_messages, request.topic_data.len());
 
         // Process each topic
         for topic_data in request.topic_data {
@@ -98,7 +116,7 @@ impl Handler {
                         (idx, result)
                     }
                 })
-                .buffer_unordered(MAX_CONCURRENT_PARTITIONS);
+                .buffered(MAX_CONCURRENT_PARTITIONS);
             
             // Collect results in order
             let mut partition_responses = vec![None; partition_count];
@@ -267,10 +285,10 @@ impl Handler {
                                             topic.is_internal = false;
                                         }
                                         
-                                        topic.partitions = vec![{
+                                        topic.partitions = (0..100).map(|partition_idx| {
                                             let mut partition = MetadataResponsePartition::default();
                                             partition.error_code = 0;
-                                            partition.partition_index = 0;
+                                            partition.partition_index = partition_idx;
                                             partition.leader_id = BrokerId(0);
                                             partition.replica_nodes = vec![BrokerId(0)];
                                             partition.isr_nodes = vec![BrokerId(0)];
@@ -278,7 +296,7 @@ impl Handler {
                                                 partition.offline_replicas = Vec::new();
                                             }
                                             partition
-                                        }];
+                                        }).collect();
                                         
                                         topic
                                     }];
@@ -405,12 +423,18 @@ async fn process_partition_batch(
     
     let batch_info = if let Some(ref records) = partition_data.records {
         let mut records_buf = Bytes::from(records.to_vec());
+        info!("Processing record batch: size={} bytes for topic={} partition={}", 
+              records.len(), topic_name, partition_data.index);
+        
         match RecordBatchDecoder::decode::<_, fn(&mut Bytes, _) -> _>(&mut records_buf) {
             Ok(decoded_records) => {
                 let messages: Vec<String> = decoded_records.into_iter()
                     .map(|record| record.value.map(|v| String::from_utf8_lossy(&v).into_owned())
                     .unwrap_or_default())
                     .collect();
+                
+                info!("Decoded {} messages from record batch for topic={} partition={}", 
+                      messages.len(), topic_name, partition_data.index);
                 
                 Some((
                     topic_name,
@@ -419,12 +443,13 @@ async fn process_partition_batch(
                 ))
             }
             Err(e) => {
-                warn!("Failed to decode record batch: {}", e);
+                warn!("Failed to decode record batch: {} (size={} bytes)", e, records.len());
                 partition_response.error_code = 1;
                 None
             }
         }
     } else {
+        info!("No records in batch for topic={} partition={}", topic_name, partition_data.index);
         None
     };
 
