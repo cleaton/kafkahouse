@@ -10,14 +10,17 @@ Before running the application, ensure you have created the required table in Cl
 
 ```sql
 CREATE TABLE messages ON CLUSTER '{cluster}' (
-    topic LowCardinality(String),
-    partition UInt32,
-    data String,
-    offset UInt64 DEFAULT generateSerialID(concat('{shard}', '_', '{replica}', '_messages')),
-    timestamp DateTime DEFAULT now()
+    topic LowCardinality(String) CODEC(ZSTD(1)),
+    partition UInt32 CODEC(ZSTD(1)),
+    offset UInt64 DEFAULT generateSerialID(concat('{shard}', '_', '{replica}', '_messages')) CODEC(Delta, ZSTD(1)),
+    key String CODEC(ZSTD(1)),
+    value String CODEC(ZSTD(1)),
+    ts DateTime64 DEFAULT now() CODEC(Delta, ZSTD(1))
 )
 ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/messages', '{replica}')
-ORDER BY (topic, partition, offset);
+PARTITION BY (toYYYYMMDD(ts))
+PRIMARY KEY (topic, partition, toStartOfTenMinutes(ts))
+ORDER BY (topic, partition, toStartOfTenMinutes(ts), offset);
 ```
 
 Note: Replace `{cluster}` with your cluster name (e.g., 'cluster_1S_2R' in the example config). or use the cluster macro in the config file.

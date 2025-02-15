@@ -189,182 +189,147 @@ impl Handler {
     where
         R: AsyncRead + Unpin,
     {
-        let mut pending_requests = Vec::with_capacity(MAX_CONCURRENT_MESSAGES);
-
         loop {
-            // Try to read as many requests as possible within the batch timeout
-            let batch_future = async {
-                while pending_requests.len() < MAX_CONCURRENT_MESSAGES {
-                    match read_request(&mut reader).await {
-                        Ok(req) => pending_requests.push(req),
-                        Err(e) => {
-                            if pending_requests.is_empty() {
-                                return Err(e);
-                            }
-                            break;
-                        }
-                    }
-                }
-                Ok(())
-            };
+            match read_request(&mut reader).await {
+                Ok(request) => {
+                    let correlation_id = request.correlation_id;
+                    let api_version = request.api_version;
+                    let api_key = request.api_key;
+                    
+                    debug!("Processing request: api_key={:?}, api_version={}, correlation_id={}", 
+                          api_key, api_version, correlation_id);
 
-            // Process batch after timeout or when buffer is full
-            match timeout(Duration::from_millis(BATCH_TIMEOUT_MS), batch_future).await {
-                Ok(result) => {
-                    if let Err(e) = result {
-                        warn!("Read error: {}", e);
-                        break;
-                    }
-                }
-                Err(_) => {
-                    // Timeout is fine, just means we'll process what we have
-                }
-            }
-
-            if !pending_requests.is_empty() {
-                // Process the batch of requests concurrently
-                let request_futures = stream::iter(pending_requests.drain(..))
-                    .map(|request| {
-                        let handler = self.clone();
-                        async move {
-                            let correlation_id = request.correlation_id;
-                            let api_version = request.api_version;
-                            let api_key = request.api_key;
+                    let result = match api_key {
+                        ApiKey::ApiVersions => {
+                            info!("Received ApiVersions request from client {:?}", request.client_id);
                             
-                            debug!("Processing request: api_key={:?}, api_version={}, correlation_id={}", 
-                                  api_key, api_version, correlation_id);
-
-                            let result = match api_key {
-                                ApiKey::ApiVersions => {
-                                    info!("Received ApiVersions request from client {:?}", request.client_id);
-                                    
-                                    let mut response = ApiVersionsResponse::default();
-                                    response.error_code = 0;
-                                    response.throttle_time_ms = 0;
-                                    
-                                    response.api_keys = vec![
-                                        create_api_version(ApiKey::Produce, 0, 2),
-                                        create_api_version(ApiKey::Metadata, 0, 1),
-                                        create_api_version(ApiKey::ApiVersions, 0, 3),
-                                    ];
-                                    
-                                    if api_version >= 3 {
-                                        response.finalized_features_epoch = 0;
-                                        response.finalized_features = Vec::new();
-                                        response.unknown_tagged_fields = BTreeMap::new();
-                                    }
-                                    
-                                    Ok((KafkaResponse::ApiVersions(response), api_version, correlation_id))
+                            let mut response = ApiVersionsResponse::default();
+                            response.error_code = 0;
+                            response.throttle_time_ms = 0;
+                            
+                            response.api_keys = vec![
+                                create_api_version(ApiKey::Produce, 0, 2),
+                                create_api_version(ApiKey::Metadata, 0, 1),
+                                create_api_version(ApiKey::ApiVersions, 0, 3),
+                            ];
+                            
+                            if api_version >= 3 {
+                                response.finalized_features_epoch = 0;
+                                response.finalized_features = Vec::new();
+                                response.unknown_tagged_fields = BTreeMap::new();
+                            }
+                            
+                            Ok((KafkaResponse::ApiVersions(response), api_version, correlation_id))
+                        }
+                        ApiKey::Metadata => {
+                            info!("Received metadata request from client {:?}", request.client_id);
+                            
+                            let mut payload = Bytes::from(request.payload);
+                            let metadata_request = MetadataRequest::decode(&mut payload, api_version)?;
+                            
+                            trace!("Metadata request: {:?}", metadata_request);
+                            
+                            let mut response = MetadataResponse::default();
+                            
+                            response.brokers = vec![{
+                                let mut broker = MetadataResponseBroker::default();
+                                broker.node_id = BrokerId(0);
+                                broker.host = StrBytes::from_string("localhost".to_string());
+                                broker.port = 9092;
+                                if api_version >= 1 {
+                                    broker.rack = None;
                                 }
+                                broker
+                            }];
+                            
+                            response.topics = vec![{
+                                let mut topic = MetadataResponseTopic::default();
+                                topic.error_code = 0;
+                                topic.name = Some(TopicName(StrBytes::from_string("test_topic".to_string())));
+                                if api_version >= 1 {
+                                    topic.is_internal = false;
+                                }
+                                
+                                topic.partitions = (0..100).map(|partition_idx| {
+                                    let mut partition = MetadataResponsePartition::default();
+                                    partition.error_code = 0;
+                                    partition.partition_index = partition_idx;
+                                    partition.leader_id = BrokerId(0);
+                                    partition.replica_nodes = vec![BrokerId(0)];
+                                    partition.isr_nodes = vec![BrokerId(0)];
+                                    if api_version >= 1 {
+                                        partition.offline_replicas = Vec::new();
+                                    }
+                                    partition
+                                }).collect();
+                                
+                                topic
+                            }];
+                            
+                            Ok((KafkaResponse::Metadata(response), api_version, correlation_id))
+                        }
+                        ApiKey::Produce => {
+                            info!("Received produce request from client {:?}", request.client_id);
+                            
+                            let produce_request = ProduceRequest::decode(
+                                &mut Bytes::from(request.payload),
+                                api_version
+                            )?;
+                            
+                            self.handle_produce_request(produce_request, api_version, correlation_id)
+                                .await
+                                .map(|resp| (KafkaResponse::Produce(resp), api_version, correlation_id))
+                        }
+                        _ => {
+                            warn!("Received unsupported request type: {:?}", api_key);
+                            // Return an error response with UNSUPPORTED_VERSION error code
+                            let mut error_response = match api_key {
                                 ApiKey::Metadata => {
-                                    info!("Received metadata request from client {:?}", request.client_id);
-                                    
-                                    let mut payload = Bytes::from(request.payload);
-                                    let metadata_request = MetadataRequest::decode(&mut payload, api_version)?;
-                                    
-                                    trace!("Metadata request: {:?}", metadata_request);
-                                    
-                                    let mut response = MetadataResponse::default();
-                                    
-                                    response.brokers = vec![{
-                                        let mut broker = MetadataResponseBroker::default();
-                                        broker.node_id = BrokerId(0);
-                                        broker.host = StrBytes::from_string("localhost".to_string());
-                                        broker.port = 9092;
-                                        if api_version >= 1 {
-                                            broker.rack = None;
-                                        }
-                                        broker
-                                    }];
-                                    
-                                    response.topics = vec![{
-                                        let mut topic = MetadataResponseTopic::default();
-                                        topic.error_code = 0;
-                                        topic.name = Some(TopicName(StrBytes::from_string("test_topic".to_string())));
-                                        if api_version >= 1 {
-                                            topic.is_internal = false;
-                                        }
-                                        
-                                        topic.partitions = (0..100).map(|partition_idx| {
-                                            let mut partition = MetadataResponsePartition::default();
-                                            partition.error_code = 0;
-                                            partition.partition_index = partition_idx;
-                                            partition.leader_id = BrokerId(0);
-                                            partition.replica_nodes = vec![BrokerId(0)];
-                                            partition.isr_nodes = vec![BrokerId(0)];
-                                            if api_version >= 1 {
-                                                partition.offline_replicas = Vec::new();
-                                            }
-                                            partition
-                                        }).collect();
-                                        
-                                        topic
-                                    }];
-                                    
-                                    Ok((KafkaResponse::Metadata(response), api_version, correlation_id))
+                                    let mut resp = MetadataResponse::default();
+                                    resp.topics = vec![];
+                                    resp.brokers = vec![];
+                                    KafkaResponse::Metadata(resp)
                                 }
                                 ApiKey::Produce => {
-                                    info!("Received produce request from client {:?}", request.client_id);
-                                    
-                                    let produce_request = ProduceRequest::decode(
-                                        &mut Bytes::from(request.payload),
-                                        api_version
-                                    )?;
-                                    
-                                    handler.handle_produce_request(produce_request, api_version, correlation_id)
-                                        .await
-                                        .map(|resp| (KafkaResponse::Produce(resp), api_version, correlation_id))
+                                    let mut resp = ProduceResponse::default();
+                                    resp.responses = vec![];
+                                    KafkaResponse::Produce(resp)
                                 }
                                 _ => {
-                                    warn!("Received unsupported request type: {:?}", api_key);
-                                    // Return an error response with UNSUPPORTED_VERSION error code
-                                    let mut error_response = match api_key {
-                                        ApiKey::Metadata => {
-                                            let mut resp = MetadataResponse::default();
-                                            resp.topics = vec![];
-                                            resp.brokers = vec![];
-                                            KafkaResponse::Metadata(resp)
-                                        }
-                                        ApiKey::Produce => {
-                                            let mut resp = ProduceResponse::default();
-                                            resp.responses = vec![];
-                                            KafkaResponse::Produce(resp)
-                                        }
-                                        _ => {
-                                            let mut resp = ApiVersionsResponse::default();
-                                            resp.error_code = 35; // UNSUPPORTED_VERSION
-                                            resp.api_keys = vec![];
-                                            KafkaResponse::ApiVersions(resp)
-                                        }
-                                    };
-                                    Ok((error_response, api_version, correlation_id))
+                                    let mut resp = ApiVersionsResponse::default();
+                                    resp.error_code = 35; // UNSUPPORTED_VERSION
+                                    resp.api_keys = vec![];
+                                    KafkaResponse::ApiVersions(resp)
                                 }
                             };
-                            
-                            result
+                            Ok((error_response, api_version, correlation_id))
                         }
-                    })
-                    .buffered(MAX_CONCURRENT_MESSAGES);
+                    };
 
-                let mut responses = Vec::new();
-                tokio::pin!(request_futures);
-                
-                while let Some(result) = request_futures.next().await {
                     match result {
-                        Ok(response) => responses.push(response),
+                        Ok(response) => {
+                            // Send single response to writer task
+                            if let Err(e) = tx.send(ResponseBatch { responses: vec![response] }).await {
+                                warn!("Failed to send response to writer: {}", e);
+                                break;
+                            }
+                        }
                         Err(e) => {
                             warn!("Error processing request: {}", e);
-                            // Add error response
+                            // Send error response
                             let mut error_response = ApiVersionsResponse::default();
                             error_response.error_code = 1; // UNKNOWN_SERVER_ERROR
-                            responses.push((KafkaResponse::ApiVersions(error_response), 0, 0));
+                            if let Err(e) = tx.send(ResponseBatch { 
+                                responses: vec![(KafkaResponse::ApiVersions(error_response), 0, 0)] 
+                            }).await {
+                                warn!("Failed to send error response to writer: {}", e);
+                                break;
+                            }
                         }
                     }
                 }
-
-                // Send batch of responses to writer task
-                if let Err(e) = tx.send(ResponseBatch { responses }).await {
-                    warn!("Failed to send responses to writer: {}", e);
+                Err(e) => {
+                    warn!("Read error: {}", e);
                     break;
                 }
             }
@@ -415,7 +380,7 @@ async fn process_partition_batch(
     topic_name: String,
     partition_data: &kafka_protocol::messages::produce_request::PartitionProduceData,
     current_offset: i64,
-) -> (PartitionProduceResponse, Option<(String, u32, Vec<String>)>) {
+) -> (PartitionProduceResponse, Option<(String, u32, Vec<(String, String)>)>) {
     let mut partition_response = PartitionProduceResponse::default();
     partition_response.index = partition_data.index;
     partition_response.error_code = 0;
@@ -428,9 +393,16 @@ async fn process_partition_batch(
         
         match RecordBatchDecoder::decode::<_, fn(&mut Bytes, _) -> _>(&mut records_buf) {
             Ok(decoded_records) => {
-                let messages: Vec<String> = decoded_records.into_iter()
-                    .map(|record| record.value.map(|v| String::from_utf8_lossy(&v).into_owned())
-                    .unwrap_or_default())
+                let messages: Vec<(String, String)> = decoded_records.into_iter()
+                    .map(|record| {
+                        let key = record.key
+                            .map(|k| String::from_utf8_lossy(&k).into_owned())
+                            .unwrap_or_default();
+                        let value = record.value
+                            .map(|v| String::from_utf8_lossy(&v).into_owned())
+                            .unwrap_or_default();
+                        (key, value)
+                    })
                     .collect();
                 
                 info!("Decoded {} messages from record batch for topic={} partition={}", 

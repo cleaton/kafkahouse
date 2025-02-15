@@ -10,10 +10,11 @@ use std::thread;
 struct Message {
     topic: String,
     partition: u32,
-    data: String,
+    key: String,
+    value: String,
 }
 
-type MessageBatch = (String, u32, Vec<String>);
+type MessageBatch = (String, u32, Vec<(String, String)>);
 
 struct InsertRequest {
     batches: Vec<MessageBatch>,
@@ -90,11 +91,12 @@ impl MessageStore {
 
         // Convert batches into Message structs
         for (topic, partition, batch_messages) in batches {
-            for msg in batch_messages {
+            for (key, value) in batch_messages {
                 messages.push(Message {
                     topic: topic.clone(),
                     partition,
-                    data: msg,
+                    key,
+                    value,
                 });
             }
         }
