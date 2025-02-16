@@ -1,5 +1,5 @@
 use anyhow::Result;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncRead, AsyncWrite, split};
 use tokio::sync::mpsc;
@@ -9,7 +9,10 @@ use kafka_protocol::messages::{
     ProduceRequest, ProduceResponse, 
     ApiVersionsResponse,
     MetadataRequest, MetadataResponse,
+    FetchRequest, FetchResponse,
+    JoinGroupRequest, JoinGroupResponse,
     ApiKey, BrokerId, TopicName,
+    ListOffsetsRequest, ListOffsetsResponse,
 };
 use kafka_protocol::messages::api_versions_response::ApiVersion;
 use kafka_protocol::messages::metadata_response::{
@@ -23,14 +26,21 @@ use kafka_protocol::messages::produce_response::{
 };
 use kafka_protocol::protocol::Decodable;
 use kafka_protocol::protocol::StrBytes;
-use kafka_protocol::records::RecordBatchDecoder;
+use kafka_protocol::records::{
+    RecordBatchDecoder, RecordBatchEncoder, Record,
+    Compression, TimestampType, RecordEncodeOptions,
+    NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_ID,
+    NO_PRODUCER_EPOCH, NO_SEQUENCE,
+};
+use kafka_protocol::protocol::buf::ByteBuf;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
+use indexmap::IndexMap;
 
 use crate::protocol::{read_request, write_response, write_api_versions_response};
-use crate::storage::MessageStore;
+use crate::storage::{MessageStore, Message, MessageFetchRequest, MessageFetchTopicPartitionRequest, MessageFetchResponse, MessageFetchTopicPartitionResponse, MessageFetchTopicPartitionData};
 
 const MAX_CONCURRENT_MESSAGES: usize = 1024;
 const MAX_CONCURRENT_PARTITIONS: usize = 100;
@@ -42,6 +52,9 @@ enum KafkaResponse {
     ApiVersions(ApiVersionsResponse),
     Produce(ProduceResponse),
     Metadata(MetadataResponse),
+    Fetch(FetchResponse),
+    JoinGroup(JoinGroupResponse),
+    ListOffsets(ListOffsetsResponse),
 }
 
 // Response type that includes correlation ID for ordering
@@ -158,17 +171,20 @@ impl Handler {
     }
 
     pub async fn handle_connection(&self, socket: TcpStream) -> Result<()> {
-        let peer = socket.peer_addr()?;
-        info!("New connection from {}", peer);
-
         let (reader, writer) = split(socket);
         let (tx, rx) = mpsc::channel(CHANNEL_SIZE);
+        
+        let handler_clone = self.clone();
+        let read_task = tokio::spawn(async move {
+            handler_clone.handle_reads(reader, tx).await
+        });
 
-        // Spawn separate tasks for reading and writing
-        let read_task = tokio::spawn(self.clone().handle_reads(reader, tx));
-        let write_task = tokio::spawn(self.clone().handle_writes(writer, rx));
+        let handler_clone = self.clone();
+        let write_task = tokio::spawn(async move {
+            handler_clone.handle_writes(writer, rx).await
+        });
 
-        // Wait for either task to complete (or error)
+        // Wait for either task to complete
         tokio::select! {
             read_result = read_task => {
                 if let Err(e) = read_result {
@@ -208,9 +224,11 @@ impl Handler {
                             response.throttle_time_ms = 0;
                             
                             response.api_keys = vec![
-                                create_api_version(ApiKey::Produce, 0, 2),
-                                create_api_version(ApiKey::Metadata, 0, 1),
+                                create_api_version(ApiKey::Produce, 0, 7),
+                                create_api_version(ApiKey::Metadata, 0, 8),
                                 create_api_version(ApiKey::ApiVersions, 0, 3),
+                                create_api_version(ApiKey::ListOffsets, 0, 5),
+                                create_api_version(ApiKey::Fetch, 0, 11),
                             ];
                             
                             if api_version >= 3 {
@@ -280,10 +298,250 @@ impl Handler {
                                 .await
                                 .map(|resp| (KafkaResponse::Produce(resp), api_version, correlation_id))
                         }
+                        ApiKey::JoinGroup => {
+                            info!("Received join group request from client {:?}", request.client_id);
+                            
+                            let mut response = JoinGroupResponse::default();
+                            response.error_code = 35; // UNSUPPORTED_VERSION
+                            
+                            Ok((KafkaResponse::JoinGroup(response), api_version, correlation_id))
+                        }
+                        ApiKey::ListOffsets => {
+                            info!("Received ListOffsets request from client {:?}", request.client_id);
+                            
+                            let mut payload = Bytes::from(request.payload);
+                            let list_offsets_request = ListOffsetsRequest::decode(&mut payload, api_version)?;
+                            
+                            trace!("ListOffsets request: {:?}", list_offsets_request);
+                            
+                            let mut response = ListOffsetsResponse::default();
+                            if api_version >= 1 {
+                                response.throttle_time_ms = 0;
+                            }
+                            
+                            // Process each topic
+                            let mut topic_responses = Vec::new();
+                            for topic_request in &list_offsets_request.topics {
+                                let mut topic_response = kafka_protocol::messages::list_offsets_response::ListOffsetsTopicResponse::default();
+                                topic_response.name = topic_request.name.clone();
+                                
+                                // Collect all partition indices
+                                let partitions: Vec<u32> = topic_request.partitions.iter()
+                                    .map(|p| p.partition_index as u32)
+                                    .collect();
+                                
+                                // Query all partitions in one go
+                                let partition_offsets = match self.message_store.get_offsets(
+                                    &topic_request.name.0,
+                                    &partitions,
+                                    topic_request.partitions[0].timestamp // Assume same timestamp for all partitions
+                                ).await {
+                                    Ok(offsets) => offsets,
+                                    Err(e) => {
+                                        warn!("Failed to get offsets: {}", e);
+                                        // On error, return 0 for all partitions
+                                        partitions.into_iter().map(|p| (p, 0)).collect()
+                                    }
+                                };
+                                
+                                // Create partition responses
+                                let mut partition_responses = Vec::new();
+                                for partition_request in &topic_request.partitions {
+                                    let mut partition_response = kafka_protocol::messages::list_offsets_response::ListOffsetsPartitionResponse::default();
+                                    partition_response.partition_index = partition_request.partition_index;
+                                    
+                                    // Find the offset for this partition
+                                    let offset = partition_offsets.iter()
+                                        .find(|(p, _)| *p == partition_request.partition_index as u32)
+                                        .map(|(_, o)| *o)
+                                        .unwrap_or(0);
+                                    
+                                    partition_response.error_code = 0;
+                                    if api_version == 0 {
+                                        partition_response.old_style_offsets = vec![offset];
+                                    } else {
+                                        partition_response.offset = offset;
+                                        partition_response.timestamp = partition_request.timestamp;
+                                    }
+                                    
+                                    partition_responses.push(partition_response);
+                                }
+                                
+                                topic_response.partitions = partition_responses;
+                                topic_responses.push(topic_response);
+                            }
+                            
+                            response.topics = topic_responses;
+                            Ok((KafkaResponse::ListOffsets(response), api_version, correlation_id))
+                        }
+                        ApiKey::Fetch => {
+                            info!("Received fetch request from client {:?}", request.client_id);
+                            
+                            let mut payload = Bytes::from(request.payload);
+                            let fetch_request = FetchRequest::decode(&mut payload, api_version)?;
+                            
+                            trace!("Fetch request: {:?}", fetch_request);
+                            
+                            let mut response = FetchResponse::default();
+                            if api_version >= 1 {
+                                response.throttle_time_ms = 0;
+                            }
+                            if api_version >= 7 {
+                                response.error_code = 0;
+                                response.session_id = 0;
+                            }
+                            if api_version >= 11 {
+                                response.node_endpoints = Vec::new();
+                                response.unknown_tagged_fields = BTreeMap::new();
+                            }
+                            
+                            // Process each topic
+                            let mut responses = Vec::new();
+                            for topic_request in &fetch_request.topics {
+                                let mut topic_response = kafka_protocol::messages::fetch_response::FetchableTopicResponse::default();
+                                topic_response.topic = topic_request.topic.clone();
+                                if api_version >= 11 {
+                                    topic_response.unknown_tagged_fields = BTreeMap::new();
+                                }
+                                
+                                // Create MessageFetchRequest
+                                let fetch_req = MessageFetchRequest {
+                                    topics: topic_request.partitions.iter().map(|partition_request| {
+                                        MessageFetchTopicPartitionRequest {
+                                            topic: topic_request.topic.0.to_string(),
+                                            partition: partition_request.partition as u32,
+                                            start_offset: partition_request.fetch_offset,
+                                            max_bytes: fetch_request.max_bytes,
+                                        }
+                                    }).collect(),
+                                    max_bytes: fetch_request.max_bytes,
+                                };
+
+                                warn!(
+                                    "About to call get_messages with {} topic partition requests",
+                                    fetch_req.topics.len()
+                                );
+
+                                // Fetch messages from ClickHouse
+                                match self.message_store.get_messages(fetch_req).await {
+                                    Ok(fetch_response) => {
+                                        let mut partitions = Vec::new();
+                                        
+                                        // Convert each topic partition response
+                                        for topic_partition in fetch_response.topics {
+                                            let mut partition_response = kafka_protocol::messages::fetch_response::PartitionData::default();
+                                            partition_response.partition_index = topic_partition.partition as i32;
+                                            partition_response.error_code = 0;
+                                            partition_response.high_watermark = topic_partition.high_watermark;
+                                            partition_response.last_stable_offset = topic_partition.high_watermark;
+                                            partition_response.log_start_offset = topic_partition.log_start_offset;
+                                            partition_response.aborted_transactions = None;
+                                            partition_response.preferred_read_replica = BrokerId(-1);
+                                            if api_version >= 11 {
+                                                partition_response.unknown_tagged_fields = BTreeMap::new();
+                                            }
+
+                                            warn!(
+                                                "Constructing fetch response for topic={} partition={}: \
+                                                partition_index={}, error_code={}, high_watermark={}, \
+                                                last_stable_offset={}, log_start_offset={}, \
+                                                data_count={}, data_offsets={:?}",
+                                                topic_partition.topic,
+                                                topic_partition.partition,
+                                                partition_response.partition_index,
+                                                partition_response.error_code,
+                                                partition_response.high_watermark,
+                                                partition_response.last_stable_offset,
+                                                partition_response.log_start_offset,
+                                                topic_partition.data.len(),
+                                                topic_partition.data.iter().map(|m| m.offset).collect::<Vec<_>>()
+                                            );
+
+                                            if !topic_partition.data.is_empty() {
+                                                // Convert our messages to Kafka Record format
+                                                let records: Vec<Record> = topic_partition.data.iter().map(|msg| {
+                                                    let record = Record {
+                                                        transactional: false,
+                                                        control: false,
+                                                        partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+                                                        producer_id: NO_PRODUCER_ID,
+                                                        producer_epoch: NO_PRODUCER_EPOCH,
+                                                        timestamp_type: TimestampType::Creation,
+                                                        offset: msg.offset,
+                                                        sequence: NO_SEQUENCE,
+                                                        timestamp: msg.timestamp,
+                                                        key: Some(Bytes::from(msg.key.clone().into_bytes())),
+                                                        value: Some(Bytes::from(msg.value.clone().into_bytes())),
+                                                        headers: IndexMap::new(),
+                                                    };
+                                                    debug!("Sending record: offset={}, key={:?}, value={:?}", 
+                                                          msg.offset, msg.key, msg.value);
+                                                    record
+                                                }).collect();
+
+                                                debug!("Encoding {} records for topic={} partition={}", 
+                                                      records.len(), topic_partition.topic, topic_partition.partition);
+
+                                                let mut buf = Vec::new();
+                                                let options = RecordEncodeOptions {
+                                                    version: 2,  // Use the latest version
+                                                    compression: Compression::None,
+                                                };
+
+                                                debug!("Attempting to encode {} records with version={}, compression={:?}", 
+                                                      records.len(), options.version, options.compression);
+
+                                                // Encode the records using Kafka's encoder
+                                                match RecordBatchEncoder::encode::<Vec<u8>, &[Record], fn(&mut BytesMut, &mut Vec<u8>, Compression) -> Result<()>>(
+                                                    &mut buf,
+                                                    records.as_slice(),
+                                                    &options,
+                                                ) {
+                                                    Ok(_) => {
+                                                        debug!("Successfully encoded {} bytes of records into batch", buf.len());
+                                                        partition_response.records = Some(Bytes::from(buf));
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("Failed to encode record batch: {}", e);
+                                                        partition_response.error_code = 1;
+                                                    }
+                                                }
+
+                                                debug!("Partition response: error_code={}, high_watermark={}, last_stable_offset={}, log_start_offset={}, records_size={:?}", 
+                                                      partition_response.error_code,
+                                                      partition_response.high_watermark,
+                                                      partition_response.last_stable_offset,
+                                                      partition_response.log_start_offset,
+                                                      partition_response.records.as_ref().map(|r| r.len()));
+                                            }
+
+                                            partitions.push(partition_response);
+                                        }
+
+                                        topic_response.partitions = partitions;
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to fetch messages: {}", e);
+                                        // On error, create error responses for all partitions
+                                        topic_response.partitions = topic_request.partitions.iter().map(|p| {
+                                            let mut partition_response = kafka_protocol::messages::fetch_response::PartitionData::default();
+                                            partition_response.partition_index = p.partition;
+                                            partition_response.error_code = 1;
+                                            partition_response
+                                        }).collect();
+                                    }
+                                }
+                                
+                                responses.push(topic_response);
+                            }
+                            
+                            response.responses = responses;
+                            Ok((KafkaResponse::Fetch(response), api_version, correlation_id))
+                        }
                         _ => {
                             warn!("Received unsupported request type: {:?}", api_key);
                             // Return an error response with UNSUPPORTED_VERSION error code
-                            let mut error_response = match api_key {
+                            let error_response = match api_key {
                                 ApiKey::Metadata => {
                                     let mut resp = MetadataResponse::default();
                                     resp.topics = vec![];
@@ -345,19 +603,27 @@ impl Handler {
         while let Some(batch) = rx.recv().await {
             for (response, api_version, correlation_id) in batch.responses {
                 match response {
-                    KafkaResponse::ApiVersions(resp) => {
-                        write_api_versions_response(&mut writer, &resp, api_version, correlation_id).await?;
+                    KafkaResponse::ApiVersions(response) => {
+                        write_api_versions_response(&mut writer, &response, api_version, correlation_id).await?;
                     }
-                    KafkaResponse::Metadata(resp) => {
-                        write_response(&mut writer, &resp, api_version, correlation_id).await?;
+                    KafkaResponse::Metadata(response) => {
+                        write_response(&mut writer, &response, api_version, correlation_id).await?;
                     }
-                    KafkaResponse::Produce(resp) => {
-                        write_response(&mut writer, &resp, api_version, correlation_id).await?;
+                    KafkaResponse::Produce(response) => {
+                        write_response(&mut writer, &response, api_version, correlation_id).await?;
+                    }
+                    KafkaResponse::Fetch(response) => {
+                        write_response(&mut writer, &response, api_version, correlation_id).await?;
+                    }
+                    KafkaResponse::JoinGroup(response) => {
+                        write_response(&mut writer, &response, api_version, correlation_id).await?;
+                    }
+                    KafkaResponse::ListOffsets(response) => {
+                        write_response(&mut writer, &response, api_version, correlation_id).await?;
                     }
                 }
             }
         }
-
         Ok(())
     }
 }
