@@ -9,7 +9,7 @@ A Kafka-compatible message broker using ClickHouse for storage.
 Before running the application, ensure you have created the required table in ClickHouse:
 
 ```sql
-CREATE TABLE messages ON CLUSTER '{cluster}' (
+CREATE TABLE kafka_messages ON CLUSTER '{cluster}' (
     topic LowCardinality(String) CODEC(ZSTD(1)),
     partition UInt32 CODEC(ZSTD(1)),
     offset UInt64 DEFAULT generateSerialID(concat('{shard}', '_', '{replica}', '_messages')) CODEC(Delta, ZSTD(1)),
@@ -17,10 +17,10 @@ CREATE TABLE messages ON CLUSTER '{cluster}' (
     value String CODEC(ZSTD(1)),
     ts DateTime64 DEFAULT now() CODEC(Delta, ZSTD(1))
 )
-ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/messages', '{replica}')
-PARTITION BY (toYYYYMMDD(ts))
-PRIMARY KEY (topic, partition, toStartOfTenMinutes(ts))
-ORDER BY (topic, partition, toStartOfTenMinutes(ts), offset);
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/kafka_messages', '{replica}')
+    PARTITION BY (toYYYYMMDD(ts))
+    PRIMARY KEY (topic, partition, toStartOfTenMinutes(ts))
+    ORDER BY (topic, partition, toStartOfTenMinutes(ts), offset);
 ```
 
 Note: Replace `{cluster}` with your cluster name (e.g., 'cluster_1S_2R' in the example config). or use the cluster macro in the config file.

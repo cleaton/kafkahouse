@@ -13,6 +13,9 @@ use kafka_protocol::messages::{
     JoinGroupRequest, JoinGroupResponse,
     ApiKey, BrokerId, TopicName,
     ListOffsetsRequest, ListOffsetsResponse,
+    FindCoordinatorRequest, FindCoordinatorResponse,
+    SyncGroupRequest, SyncGroupResponse,
+    HeartbeatRequest, HeartbeatResponse,
 };
 use kafka_protocol::messages::api_versions_response::ApiVersion;
 use kafka_protocol::messages::metadata_response::{
@@ -55,6 +58,9 @@ enum KafkaResponse {
     Fetch(FetchResponse),
     JoinGroup(JoinGroupResponse),
     ListOffsets(ListOffsetsResponse),
+    FindCoordinator(FindCoordinatorResponse),
+    SyncGroup(SyncGroupResponse),
+    Heartbeat(HeartbeatResponse),
 }
 
 // Response type that includes correlation ID for ordering
@@ -229,6 +235,10 @@ impl Handler {
                                 create_api_version(ApiKey::ApiVersions, 0, 3),
                                 create_api_version(ApiKey::ListOffsets, 0, 5),
                                 create_api_version(ApiKey::Fetch, 0, 11),
+                                create_api_version(ApiKey::FindCoordinator, 0, 3),
+                                create_api_version(ApiKey::JoinGroup, 0, 5),
+                                create_api_version(ApiKey::SyncGroup, 0, 5),
+                                create_api_version(ApiKey::Heartbeat, 0, 4),
                             ];
                             
                             if api_version >= 3 {
@@ -301,8 +311,32 @@ impl Handler {
                         ApiKey::JoinGroup => {
                             info!("Received join group request from client {:?}", request.client_id);
                             
+                            let mut payload = Bytes::from(request.payload);
+                            let join_group_request = JoinGroupRequest::decode(&mut payload, api_version)?;
+                            
+                            trace!("JoinGroup request: group_id={:?}, member_id={:?}", 
+                                  join_group_request.group_id,
+                                  join_group_request.member_id);
+                            
                             let mut response = JoinGroupResponse::default();
-                            response.error_code = 35; // UNSUPPORTED_VERSION
+                            response.error_code = 0;
+                            if api_version >= 2 {
+                                response.throttle_time_ms = 0;
+                            }
+                            
+                            // Make this member the leader since we're a single-broker setup
+                            response.generation_id = 1;
+                            response.protocol_type = Some(join_group_request.protocol_type);
+                            response.protocol_name = Some(join_group_request.protocols.first()
+                                .map(|p| p.name.clone())
+                                .unwrap_or_else(|| StrBytes::from_string("consumer".to_string())));
+                            response.leader = join_group_request.member_id.clone();
+                            response.member_id = join_group_request.member_id;
+                            response.members = vec![];  // No other members in the group
+                            
+                            if api_version >= 7 {
+                                response.unknown_tagged_fields = BTreeMap::new();
+                            }
                             
                             Ok((KafkaResponse::JoinGroup(response), api_version, correlation_id))
                         }
@@ -538,6 +572,104 @@ impl Handler {
                             response.responses = responses;
                             Ok((KafkaResponse::Fetch(response), api_version, correlation_id))
                         }
+                        ApiKey::FindCoordinator => {
+                            info!("Received FindCoordinator request from client {:?}", request.client_id);
+                            
+                            let mut payload = Bytes::from(request.payload);
+                            let find_coordinator_request = FindCoordinatorRequest::decode(&mut payload, api_version)?;
+                            
+                            trace!("FindCoordinator request: key_type={:?}, key={}", 
+                                  find_coordinator_request.key_type,
+                                  find_coordinator_request.key);
+                            
+                            let mut response = FindCoordinatorResponse::default();
+                            if api_version >= 1 {
+                                response.throttle_time_ms = 0;
+                            }
+                            response.error_code = 0;
+                            
+                            // Always return our single broker as the coordinator
+                            response.node_id = BrokerId(0);
+                            response.host = StrBytes::from_string("127.0.0.1".to_string());
+                            response.port = 9092;
+                            
+                            if api_version >= 1 {
+                                response.error_message = None;
+                            }
+
+                            if api_version >= 3 {
+                                response.unknown_tagged_fields = BTreeMap::new();
+                            }
+                            
+                            Ok((KafkaResponse::FindCoordinator(response), api_version, correlation_id))
+                        }
+                        ApiKey::SyncGroup => {
+                            info!("Received SyncGroup request from client {:?}", request.client_id);
+                            
+                            let mut payload = Bytes::from(request.payload);
+                            let sync_group_request = SyncGroupRequest::decode(&mut payload, api_version)?;
+                            
+                            trace!("SyncGroup request: group_id={:?}, member_id={:?}, generation_id={}", 
+                                  sync_group_request.group_id,
+                                  sync_group_request.member_id,
+                                  sync_group_request.generation_id);
+                            
+                            // Create a default response and set the fields according to the documentation
+                            let mut response = SyncGroupResponse::default();
+                            response.error_code = 0; // Success
+                            
+                            if api_version >= 1 {
+                                response.throttle_time_ms = 0;
+                            }
+                            
+                            // Create a simple assignment with a single partition
+                            let mut buf = Vec::new();
+                            // Version (2 bytes)
+                            buf.extend_from_slice(&[0, 0]);
+                            // Number of topics (2 bytes)
+                            buf.extend_from_slice(&[0, 1]);
+                            // Topic name length (2 bytes)
+                            let topic_name = b"test_topic";
+                            buf.extend_from_slice(&[(topic_name.len() >> 8) as u8, topic_name.len() as u8]);
+                            // Topic name
+                            buf.extend_from_slice(topic_name);
+                            // Number of partitions (4 bytes)
+                            buf.extend_from_slice(&[0, 0, 0, 1]);
+                            // Partition ID (4 bytes)
+                            buf.extend_from_slice(&[0, 0, 0, 0]);
+                            
+                            response.assignment = Bytes::from(buf);
+                            
+                            if api_version >= 5 {
+                                response.protocol_type = None;
+                                response.protocol_name = None;
+                                response.unknown_tagged_fields = BTreeMap::new();
+                            }
+                            
+                            Ok((KafkaResponse::SyncGroup(response), api_version, correlation_id))
+                        }
+                        ApiKey::Heartbeat => {
+                            info!("Received Heartbeat request from client {:?}", request.client_id);
+                            
+                            let mut payload = Bytes::from(request.payload);
+                            let heartbeat_request = HeartbeatRequest::decode(&mut payload, api_version)?;
+                            
+                            trace!("Heartbeat request: group_id={:?}, member_id={:?}, generation_id={}", 
+                                  heartbeat_request.group_id,
+                                  heartbeat_request.member_id,
+                                  heartbeat_request.generation_id);
+                            
+                            let mut response = HeartbeatResponse::default();
+                            response.error_code = 0;
+                            if api_version >= 1 {
+                                response.throttle_time_ms = 0;
+                            }
+                            if api_version >= 4 {
+                                response.unknown_tagged_fields = BTreeMap::new();
+                            }
+                            
+                            Ok((KafkaResponse::Heartbeat(response), api_version, correlation_id))
+                        }
                         _ => {
                             warn!("Received unsupported request type: {:?}", api_key);
                             // Return an error response with UNSUPPORTED_VERSION error code
@@ -619,6 +751,15 @@ impl Handler {
                         write_response(&mut writer, &response, api_version, correlation_id).await?;
                     }
                     KafkaResponse::ListOffsets(response) => {
+                        write_response(&mut writer, &response, api_version, correlation_id).await?;
+                    }
+                    KafkaResponse::FindCoordinator(response) => {
+                        write_response(&mut writer, &response, api_version, correlation_id).await?;
+                    }
+                    KafkaResponse::SyncGroup(response) => {
+                        write_response(&mut writer, &response, api_version, correlation_id).await?;
+                    }
+                    KafkaResponse::Heartbeat(response) => {
                         write_response(&mut writer, &response, api_version, correlation_id).await?;
                     }
                 }
