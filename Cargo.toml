@@ -1,0 +1,20 @@
+[package]
+name = "kafka_ch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kafka-protocol = { version = "0.14.1", features = ["messages_enums", "broker"] }
+tokio = { version = "1.43.0", features = ["full"] }
+futures = "0.3"
+bytes = "1.5"
+tokio-stream = "0.1.17"
+anyhow = "1.0.96"
+log = "0.4.26"
+env_logger = "0.11.6"
+async-trait = "0.1.77"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
+clickhouse = "0.13.1"
+indexmap = "2.7.1"
