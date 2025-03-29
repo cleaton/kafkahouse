@@ -10,6 +10,7 @@ use serde::Serialize;
 use tokio::net::TcpListener;
 
 use crate::kafka::client::KafkaClient;
+use crate::kafka::consumer_group::SharedConsumerGroupCache;
 use super::types::TopicPartitions;
 
 #[derive(Row, Serialize)]
@@ -21,6 +22,7 @@ struct KafkaMessageInsert {
 
 pub struct Broker {
     client: Client,
+    consumer_group_cache: Option<SharedConsumerGroupCache>,
 }
 
 impl Broker {
@@ -30,7 +32,16 @@ impl Broker {
             .with_url("http://127.0.0.1:8123")
             .with_option("async_insert", "1")
             .with_option("wait_for_async_insert", "1"),
+            consumer_group_cache: None,
         })
+    }
+    
+    pub fn with_consumer_group_cache(self: &Arc<Self>, cache: SharedConsumerGroupCache) -> Arc<Self> {
+        let broker = Arc::new(Self {
+            client: self.client.clone(),
+            consumer_group_cache: Some(cache),
+        });
+        broker
     }
 
     pub async fn produce(&self, mut req: ProduceRequest) -> Result<ProduceResponse, anyhow::Error> {
