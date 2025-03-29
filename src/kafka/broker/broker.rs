@@ -5,7 +5,7 @@ use kafka_protocol::messages::{ProduceRequest, ProduceResponse};
 use kafka_protocol::messages::produce_response::{TopicProduceResponse, PartitionProduceResponse, LeaderIdAndEpoch};
 use clickhouse::{Client, Row};
 use kafka_protocol::records::{RecordBatchDecoder, Compression};
-use log::{info, debug};
+use log::{info, debug, error};
 use serde::Serialize;
 use tokio::net::TcpListener;
 
@@ -22,26 +22,26 @@ struct KafkaMessageInsert {
 
 pub struct Broker {
     client: Client,
-    consumer_group_cache: Option<SharedConsumerGroupCache>,
+    consumer_group_cache: Arc<SharedConsumerGroupCache>,
 }
 
 impl Broker {
     pub fn new() -> Arc<Self> {
+        // Initialize the shared consumer group cache
+        let consumer_group_cache = Arc::new(SharedConsumerGroupCache::new());
+        
         Arc::new(Self {
             client: Client::default()
             .with_url("http://127.0.0.1:8123")
             .with_option("async_insert", "1")
             .with_option("wait_for_async_insert", "1"),
-            consumer_group_cache: None,
+            consumer_group_cache,
         })
     }
     
-    pub fn with_consumer_group_cache(self: &Arc<Self>, cache: SharedConsumerGroupCache) -> Arc<Self> {
-        let broker = Arc::new(Self {
-            client: self.client.clone(),
-            consumer_group_cache: Some(cache),
-        });
-        broker
+    // Get a reference to the consumer group cache
+    pub fn consumer_group_cache(&self) -> Arc<SharedConsumerGroupCache> {
+        self.consumer_group_cache.clone()
     }
 
     pub async fn produce(&self, mut req: ProduceRequest) -> Result<ProduceResponse, anyhow::Error> {
@@ -99,6 +99,15 @@ impl Broker {
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<(), anyhow::Error> {
+        // Start the consumer group cache worker
+        let clickhouse_url = "http://127.0.0.1:8123";
+        let cache_clone = self.consumer_group_cache.clone();
+        tokio::spawn(async move {
+            if let Err(e) = cache_clone.start_worker(clickhouse_url.to_string()).await {
+                error!("Failed to start consumer group cache worker: {}", e);
+            }
+        });
+        
         let listener = TcpListener::bind("127.0.0.1:9092").await?;
         info!("Kafka broker listening on port 9092");
     

@@ -22,6 +22,7 @@ use super::protocol::{
     KafkaResponseMessage,
 };
 use super::Broker;
+use super::consumer_group::SharedConsumerGroupCache;
 
 static SUPPORTED_API_VERSIONS: OnceLock<Vec<ApiVersion>> = OnceLock::new();
 
@@ -110,6 +111,9 @@ pub struct KafkaClient {
     // Consumer group information
     pub(crate) consumer_groups: HashMap<String, HashMap<String, i32>>, // group_id -> (member_id -> generation_id)
     
+    // Consumer group cache
+    pub(crate) consumer_group_cache: Arc<SharedConsumerGroupCache>,
+    
     // Subscribed topics for each consumer group member
     pub(crate) member_subscriptions: HashMap<String, Vec<String>>, // member_id -> [topic]
     
@@ -174,12 +178,16 @@ async fn read_loop(request_tx: mpsc::Sender<KafkaRequestMessage>, tcp_reader: &m
 
 impl KafkaClient {
     pub fn new(broker: Arc<Broker>) -> Self {
+        // Use the broker's shared consumer group cache
+        let consumer_group_cache = broker.consumer_group_cache();
+        
         Self {
             broker_id: 0,
             cluster_id: "test-cluster".to_string(),
             controller_id: Some(0),
             topics: HashMap::new(),
             consumer_groups: HashMap::new(),
+            consumer_group_cache,
             member_subscriptions: HashMap::new(),
             committed_offsets: HashMap::new(),
             supported_api_versions: init_api_versions(),

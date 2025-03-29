@@ -6,8 +6,10 @@ use log::{debug, info};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 
 use crate::kafka::client::KafkaClient;
+use crate::kafka::consumer_group::{GroupMember, TopicAssignments};
 
 /// Extract subscribed topics from the member metadata
 fn extract_subscribed_topics(protocol_metadata: &Bytes) -> Vec<String> {
@@ -78,6 +80,8 @@ pub(crate) async fn handle_join_group(
     info!("Handling JoinGroup request: group_id={:?}, member_id={:?}, protocol_type={:?}",
           request.group_id, request.member_id, request.protocol_type);
     
+    let group_id = request.group_id.to_string();
+    
     // Generate a member ID if one wasn't provided
     let member_id = if request.member_id.is_empty() {
         // Create a unique member ID using timestamp and a counter
@@ -86,44 +90,60 @@ pub(crate) async fn handle_join_group(
             .unwrap_or_default()
             .as_millis();
         
-        format!("{}_{}", request.group_id.0, timestamp)
+        format!("{}_{}", group_id, timestamp)
     } else {
         request.member_id.to_string()
     };
     
     debug!("Assigned member ID: {}", member_id);
     
-    // Extract subscribed topics from the protocol metadata
+    // Extract subscribed topics
+    let mut subscribed_topics = Vec::new();
+    
     if let Some(protocol) = request.protocols.first() {
-        let subscribed_topics = extract_subscribed_topics(&protocol.metadata);
+        subscribed_topics = extract_subscribed_topics(&protocol.metadata);
         debug!("Member {} subscribed to topics: {:?}", member_id, subscribed_topics);
         
-        // Store the subscribed topics
-        client.member_subscriptions.insert(member_id.clone(), subscribed_topics);
+        // Store the subscribed topics in the client for later use
+        client.member_subscriptions.insert(member_id.clone(), subscribed_topics.clone());
     }
     
-    // Create a basic response
+    // Check existing group state from cache
+    let group_exists = client.consumer_group_cache.get_group(&group_id).is_some();
+    let generation_id = client.consumer_group_cache.get_group_generation(&group_id).unwrap_or(1);
+    
+    // For now, set initial generation to 1 if it's a new group
+    let generation_id = if group_exists { generation_id } else { 1 };
+    
+    // Store in local client map for quick reference
+    client.consumer_groups.entry(group_id.clone())
+        .or_insert_with(HashMap::new)
+        .insert(member_id.clone(), generation_id);
+    
+    // Get leader from shared cache or set this member as leader if it's a new group
+    let leader_id = if let Some(leader) = client.consumer_group_cache.get_group_leader(&group_id) {
+        leader.member_id
+    } else {
+        // If no leader exists, this member becomes the leader
+        member_id.clone()
+    };
+    
+    debug!("JoinGroup response for {}: leader={}, member_id={}, generation_id={}",
+           group_id, leader_id, member_id, generation_id);
+    
+    // Build the response with members list if this is the leader
+    let members = Vec::new(); // We'll populate this in the sync phase
+    
+    // Create the response
     let response = JoinGroupResponse::default()
         .with_throttle_time_ms(0)
         .with_error_code(0)
-        .with_generation_id(1) // Start with generation 1
+        .with_generation_id(generation_id)
         .with_protocol_type(Some(request.protocol_type.clone()))
         .with_protocol_name(request.protocols.first().map(|p| p.name.clone()))
-        .with_leader(StrBytes::from_string(member_id.clone()))
-        .with_member_id(StrBytes::from_string(member_id.clone()))
-        .with_members(vec![]);
-    
-    // For simplicity, we'll make the first member the leader
-    // In a real implementation, we would track group membership and rebalance as needed
-    
-    // Store group information in the client
-    let group_id = request.group_id.0.to_string();
-    client.consumer_groups.entry(group_id.clone())
-        .or_insert_with(HashMap::new)
-        .insert(member_id.clone(), response.generation_id);
-    
-    debug!("JoinGroup response: leader={:?}, member_id={:?}, generation_id={}",
-           response.leader, response.member_id, response.generation_id);
+        .with_leader(StrBytes::from_string(leader_id))
+        .with_member_id(StrBytes::from_string(member_id))
+        .with_members(members);
     
     // Compute response size
     let response_size = response.compute_size(api_version)? as i32;

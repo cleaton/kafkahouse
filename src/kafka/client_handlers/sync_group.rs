@@ -5,9 +5,11 @@ use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
 use kafka_protocol::protocol::Encodable;
 use kafka_protocol::protocol::StrBytes;
 use log::{debug, info};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::collections::HashSet;
 
 use crate::kafka::client::KafkaClient;
+use crate::kafka::consumer_group::GroupMember;
 
 /// Represents a topic and its partitions for consumer group assignment
 struct TopicPartitions {
@@ -77,28 +79,105 @@ pub(crate) async fn handle_sync_group(
     request: &SyncGroupRequest,
     api_version: i16,
 ) -> Result<(ResponseKind, i32), anyhow::Error> {
-    info!("Handling SyncGroup request: group_id={:?}, member_id={:?}, generation_id={}",
-          request.group_id, request.member_id, request.generation_id);
-    
-    // Get the member ID
+    let group_id = request.group_id.to_string();
     let member_id = request.member_id.to_string();
+    let generation_id = request.generation_id;
     
-    // Get the subscribed topics for this member
-    let subscribed_topics = client.member_subscriptions.get(&member_id)
-        .cloned()
-        .unwrap_or_else(|| vec!["testing_clickhouse_broker".to_string()]);
+    info!("Handling SyncGroup request: group_id={}, member_id={}, generation_id={}",
+          group_id, member_id, generation_id);
     
-    debug!("Member {} is subscribed to topics: {:?}", member_id, subscribed_topics);
+    // Check if this member is the leader
+    let is_leader = if let Some(leader) = client.consumer_group_cache.get_group_leader(&group_id) {
+        leader.member_id == member_id
+    } else {
+        // If no group exists yet, the first member becomes leader
+        true
+    };
     
-    // Create topic partitions for each subscribed topic
-    let mut topic_partitions = Vec::new();
-    for topic in subscribed_topics {
-        // For simplicity, we'll assign all partitions (0-99) for each topic
-        // In a real implementation, we would distribute partitions among group members
-        topic_partitions.push(TopicPartitions::new(topic, (0..100).collect()));
+    // Get all subscribed topics for all members in the group
+    let mut all_topics: HashSet<String> = HashSet::new();
+    let mut member_topics: HashMap<String, Vec<String>> = HashMap::new();
+    
+    // Add this member's subscribed topics
+    if let Some(topics) = client.member_subscriptions.get(&member_id) {
+        all_topics.extend(topics.clone());
+        member_topics.insert(member_id.clone(), topics.clone());
     }
     
-    // Create the consumer assignment
+    // If leader, gather member assignments from all sync group data
+    if is_leader {
+        debug!("Member {} is the leader of group {}", member_id, group_id);
+        
+        // Process leader's assignments for all members
+        for assignment_data in &request.assignments {
+            let member_id = assignment_data.member_id.to_string();
+            
+            // Store member assignment
+            if let Some(topics) = client.member_subscriptions.get(&member_id) {
+                all_topics.extend(topics.clone());
+                member_topics.insert(member_id, topics.clone());
+            }
+        }
+        
+        // Get partition count information for each topic
+        // For simplicity, assume 10 partitions per topic
+        let partition_counts: HashMap<String, i32> = all_topics.iter()
+            .map(|topic| (topic.clone(), 10))
+            .collect();
+        
+        // Convert topic set to vector for assignment
+        let topics_vec: Vec<String> = all_topics.into_iter().collect();
+        
+        // Get all members from the client's local state
+        let all_members: Vec<GroupMember> = if let Some(group) = client.consumer_group_cache.get_group(&group_id) {
+            group.members
+        } else {
+            Vec::new()
+        };
+            
+        // Create assignments using GroupMember's built-in function
+        let assignments = GroupMember::create_assignments(
+            &group_id,
+            &all_members,
+            &topics_vec,
+            &partition_counts
+        );
+        
+        debug!("Leader created assignments for group {}: {:?}", group_id, assignments);
+        
+        // TODO: Store assignments in ClickHouse via the broker
+        // This would happen in a full implementation
+    }
+    
+    // Get individual member's assignment (different for leader vs member)
+    let mut member_assignment = HashMap::new();
+    if let Some(group) = client.consumer_group_cache.get_group(&group_id) {
+        for group_member in &group.members {
+            if group_member.member_id == member_id {
+                // Found our member, extract topic-partitions
+                member_assignment = group_member.assignments.clone();
+                break;
+            }
+        }
+    }
+    
+    // Convert our member's assignment to TopicPartitions format for response
+    let mut topic_partitions = Vec::new();
+    for (topic, partitions) in &member_assignment {
+        topic_partitions.push(TopicPartitions::new(topic.clone(), partitions.clone()));
+    }
+    
+    // If we have no assignments yet, just assign all subscribed topics
+    if topic_partitions.is_empty() {
+        if let Some(topics) = client.member_subscriptions.get(&member_id) {
+            for topic in topics {
+                // For simplicity, assign all partitions 0-9 to this member
+                topic_partitions.push(TopicPartitions::new(topic.clone(), (0..10).collect()));
+            }
+        }
+    }
+    
+    // Create the consumer assignment for this member
     let assignment_buf = create_consumer_assignment(&topic_partitions);
     
     // Create response
@@ -111,7 +190,7 @@ pub(crate) async fn handle_sync_group(
         .with_assignment(assignment_buf.freeze())
         .with_unknown_tagged_fields(BTreeMap::new());
     
-    debug!("SyncGroup response sent with assignment of size {} bytes", assignment_size);
+    debug!("SyncGroup response sent to {} with assignment of size {} bytes", member_id, assignment_size);
     
     // Compute response size
     let response_size = response.compute_size(api_version)? as i32;

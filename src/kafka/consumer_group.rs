@@ -90,7 +90,7 @@ impl GroupMember {
     /// Create assignments for a consumer group based on subscribed topics and member metadata
     /// This is called by the leader to determine partition assignments for all members
     pub fn create_assignments(
-        group_id: &str, 
+        _group_id: &str, 
         members: &[GroupMember], 
         topics: &[String],
         partition_counts: &HashMap<String, i32>
