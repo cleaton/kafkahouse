@@ -6,10 +6,8 @@ use log::{debug, info};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 
 use crate::kafka::client::KafkaClient;
-use crate::kafka::consumer_group::{GroupMember, TopicAssignments};
 
 /// Extract subscribed topics from the member metadata
 fn extract_subscribed_topics(protocol_metadata: &Bytes) -> Vec<String> {
@@ -98,14 +96,14 @@ pub(crate) async fn handle_join_group(
     debug!("Assigned member ID: {}", member_id);
     
     // Extract subscribed topics
-    let mut subscribed_topics = Vec::new();
+    let mut _subscribed_topics = Vec::new();
     
     if let Some(protocol) = request.protocols.first() {
-        subscribed_topics = extract_subscribed_topics(&protocol.metadata);
-        debug!("Member {} subscribed to topics: {:?}", member_id, subscribed_topics);
+        _subscribed_topics = extract_subscribed_topics(&protocol.metadata);
+        debug!("Member {} subscribed to topics: {:?}", member_id, _subscribed_topics);
         
         // Store the subscribed topics in the client for later use
-        client.member_subscriptions.insert(member_id.clone(), subscribed_topics.clone());
+        client.member_subscriptions.insert(member_id.clone(), _subscribed_topics.clone());
     }
     
     // Check existing group state from cache

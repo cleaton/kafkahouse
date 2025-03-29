@@ -5,8 +5,7 @@ use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
 use kafka_protocol::protocol::Encodable;
 use kafka_protocol::protocol::StrBytes;
 use log::{debug, info};
-use std::collections::{BTreeMap, HashMap};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::kafka::client::KafkaClient;
 use crate::kafka::consumer_group::GroupMember;
