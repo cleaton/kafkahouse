@@ -1,11 +1,11 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use kafka_protocol::messages::*;
 use kafka_protocol::messages::heartbeat_response::HeartbeatResponse;
 use kafka_protocol::protocol::Encodable;
 use log::{debug, info};
 use std::collections::HashSet;
 
-use crate::kafka::client::KafkaClient;
+use crate::kafka::{client::KafkaClient, client_types::MemberAction};
 
 pub(crate) async fn handle_heartbeat(
     client: &mut KafkaClient,
@@ -19,59 +19,32 @@ pub(crate) async fn handle_heartbeat(
     info!("Handling Heartbeat request: group_id={}, member_id={}, generation_id={}",
           group_id, member_id, generation_id);
     
-    // Check if member should rejoin based on shared cache state
-    let should_rejoin = client.consumer_group_cache.should_member_rejoin(&group_id, &member_id, generation_id);
+    // Check if the member's generation matches the group's current generation
+    let current_generation = client.consumer_group_cache.get_group_generation(&group_id).unwrap_or(1);
+    let leader = client.consumer_group_cache.get_group_leader(&group_id).unwrap_or_else(|| member_id.clone());
+
+    let group_info = client.joined_groups.get_mut(&group_id).map(|g| Ok(g)).unwrap_or(Err(anyhow!("missing group")))?;
+
+    client.consumer_group_cache.write_action(MemberAction::Heartbeat, client.client_id.clone(),client.client_host.clone(), group_id.clone(), generation_id, group_info).await?;
     
-    // Check if this member is the leader
-    let is_leader = if let Some(_group) = client.consumer_group_cache.get_group(&group_id) {
-        if let Some(leader) = client.consumer_group_cache.get_group_leader(&group_id) {
-            leader.member_id == member_id
-        } else {
-            false
-        }
+    // Determine error code based on whether member should rejoin
+    let mut error_code = if current_generation != generation_id {
+        debug!("Member {} has outdated generation {} (current is {}), requesting rejoin",
+               member_id, generation_id, current_generation);
+        16 // REBALANCE_IN_PROGRESS
     } else {
-        false
+        0 // SUCCESS
     };
-    
-    // Leader-specific logic - check if rebalance needed
-    if is_leader {
-        debug!("Member {} is the leader of group {}", member_id, group_id);
-        
-        // Check if expected members match current members
-        if let Some(group_members) = client.consumer_groups.get(&group_id) {
-            // Get current members from local state
-            let expected_members: HashSet<String> = group_members.keys().cloned().collect();
-            
-            // Check if rebalance is needed
-            let should_rebalance = client.consumer_group_cache.should_leader_rebalance(&group_id, &expected_members);
-            
-            if should_rebalance {
-                debug!("Leader detected membership changes. Triggering rebalance for group {}", group_id);
-                // Return REBALANCE_IN_PROGRESS to trigger rejoin
-                let response = HeartbeatResponse::default()
-                    .with_throttle_time_ms(0)
-                    .with_error_code(27); // REBALANCE_IN_PROGRESS
-                
-                let response_size = response.compute_size(api_version)? as i32;
-                return Ok((ResponseKind::Heartbeat(response), response_size));
+
+
+    if (leader == member_id) {
+        if let Some(group_info) = client.joined_groups.get(&group_id) {
+            let members = client.consumer_group_cache.get_members(&group_id);
+            if group_info.should_rebalance(&members) {
+                error_code = 16;
             }
         }
     }
-    
-    // Determine error code based on whether member should rejoin
-    let error_code = if should_rejoin {
-        debug!("Member {} should rejoin group {}", member_id, group_id);
-        if client.consumer_group_cache.get_group(&group_id).is_some() {
-            // Group exists but member needs to rejoin - likely generation change
-            22 // ILLEGAL_GENERATION
-        } else {
-            // Group doesn't exist
-            25 // UNKNOWN_MEMBER_ID
-        }
-    } else {
-        // Valid heartbeat
-        0
-    };
     
     // Create response
     let response = HeartbeatResponse::default()

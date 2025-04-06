@@ -4,8 +4,10 @@ use kafka_protocol::messages::join_group_response::JoinGroupResponse;
 use kafka_protocol::protocol::{Encodable, StrBytes};
 use log::{debug, info};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use crate::kafka::client_types::*;
 
 use crate::kafka::client::KafkaClient;
 
@@ -93,44 +95,53 @@ pub(crate) async fn handle_join_group(
         request.member_id.to_string()
     };
     
-    debug!("Assigned member ID: {}", member_id);
-    
-    // Extract subscribed topics
-    let mut _subscribed_topics = Vec::new();
-    
+    let group_info = client.joined_groups.entry(group_id.clone()).or_insert_with(|| {
+        GroupInfo {
+            member_info: MemberInfo {
+                join_time: Utc::now(),
+                session_timeout_ms: request.session_timeout_ms,
+                rebalance_timeout_ms: request.rebalance_timeout_ms,
+                member_id: member_id.clone(),
+                subscribed_topics: Vec::new(),
+                group_instance_id: request.group_instance_id.clone().map(|s| s.to_string()),
+                protocol_type: request.protocol_type.clone().to_string(),
+                protocol: request.protocols.iter()
+                    .map(|p| (p.name.clone().to_string(), p.metadata.clone().to_vec()))
+                    .collect()
+            },
+            members: Vec::new(),
+            assignments: Vec::new()
+        }
+    });
+
+
     if let Some(protocol) = request.protocols.first() {
-        _subscribed_topics = extract_subscribed_topics(&protocol.metadata);
-        debug!("Member {} subscribed to topics: {:?}", member_id, _subscribed_topics);
-        
-        // Store the subscribed topics in the client for later use
-        client.member_subscriptions.insert(member_id.clone(), _subscribed_topics.clone());
+        group_info.member_info.subscribed_topics = extract_subscribed_topics(&protocol.metadata);
+        debug!("Member {} subscribed to topics: {:?}", member_id, group_info.member_info.subscribed_topics);
     }
-    
-    // Check existing group state from cache
-    let group_exists = client.consumer_group_cache.get_group(&group_id).is_some();
-    let generation_id = client.consumer_group_cache.get_group_generation(&group_id).unwrap_or(1);
-    
-    // For now, set initial generation to 1 if it's a new group
-    let generation_id = if group_exists { generation_id } else { 1 };
-    
-    // Store in local client map for quick reference
-    client.consumer_groups.entry(group_id.clone())
-        .or_insert_with(HashMap::new)
-        .insert(member_id.clone(), generation_id);
-    
-    // Get leader from shared cache or set this member as leader if it's a new group
-    let leader_id = if let Some(leader) = client.consumer_group_cache.get_group_leader(&group_id) {
-        leader.member_id
-    } else {
-        // If no leader exists, this member becomes the leader
-        member_id.clone()
-    };
-    
+
+    // Get current generation ID and leader
+    let mut generation_id = client.consumer_group_cache.get_group_generation(&group_id).unwrap_or(1);
+
+    // Join the consumer group using the cache
+    client.consumer_group_cache.write_action(MemberAction::JoinGroup, client.client_id.clone(), client.client_host.clone(), group_id.clone(), generation_id, group_info).await?;
+
+    // Wait for the member to appear in the cache with the correct generation
+    client.consumer_group_cache.wait_for_member_generation(&group_id, &member_id, generation_id, Duration::from_secs(10)).await?;
+
+    let leader = client.consumer_group_cache.get_group_leader(&group_id).unwrap_or_else(|| member_id.clone());
+
     debug!("JoinGroup response for {}: leader={}, member_id={}, generation_id={}",
-           group_id, leader_id, member_id, generation_id);
+           group_id, leader, member_id, generation_id);
+           
     
-    // Build the response with members list if this is the leader
-    let members = Vec::new(); // We'll populate this in the sync phase
+    let members = client.consumer_group_cache.get_members(&group_id);
+
+    if member_id == leader && group_info.should_rebalance(&members) {
+        generation_id += 1;
+    }
+
+    group_info.members = members.clone();
     
     // Create the response
     let response = JoinGroupResponse::default()
@@ -139,7 +150,7 @@ pub(crate) async fn handle_join_group(
         .with_generation_id(generation_id)
         .with_protocol_type(Some(request.protocol_type.clone()))
         .with_protocol_name(request.protocols.first().map(|p| p.name.clone()))
-        .with_leader(StrBytes::from_string(leader_id))
+        .with_leader(StrBytes::from_string(leader))
         .with_member_id(StrBytes::from_string(member_id))
         .with_members(members);
     

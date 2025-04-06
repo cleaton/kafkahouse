@@ -100,22 +100,21 @@ Consumer group metadata will be stored in ClickHouse tables:
 CREATE TABLE group_members ON CLUSTER '{cluster}' (
     group_id String,
     member_id String,
+    action Enum('JoinGroup' = 1, 'SyncGroup' = 2, 'Heartbeat' = 3, 'LeaveGroup' = 4),
     generation_id Int32,
     protocol_type String,
-    protocol_name String,
+    protocol Map(String, String) COMMENT 'Array of name, metadata',
     client_id String,
     client_host String,
-    metadata String,
-    assignment Map(String, Map(Int32, String)) COMMENT 'Map of topic -> (partition_id -> member_id)', 
+    subscribed_topics Array(String),
+    assignments Map(String, String) COMMENT 'Map of member_id -> Assignment Bytes', 
     join_time DateTime64(9) DEFAULT now64(),
-    heartbeat_time DateTime64(9) DEFAULT now64(),
-    state String,
-    PRIMARY KEY (group_id, member_id)
+    update_time DateTime64(9) DEFAULT now64()
 )
 ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/group_members', '{replica}')
-PARTITION BY toYYYYMMDD(toStartOfInterval(heartbeat_time, INTERVAL 1 WEEK))
-ORDER BY (group_id, member_id, heartbeat_time)
-TTL heartbeat_time + INTERVAL 4 WEEK;
+PARTITION BY toYYYYMMDD(toStartOfInterval(update_time, INTERVAL 1 WEEK))
+ORDER BY (group_id, member_id, update_time)
+TTL toDate(update_time) + INTERVAL 4 WEEK;
 
 -- Offset tracking table
 CREATE TABLE consumer_offsets ON CLUSTER '{cluster}' (

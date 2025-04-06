@@ -10,7 +10,7 @@ use serde::Serialize;
 use tokio::net::TcpListener;
 
 use crate::kafka::client::KafkaClient;
-use crate::kafka::consumer_group::SharedConsumerGroupCache;
+use crate::kafka::consumer_group::ConsumerGroups;
 use super::types::TopicPartitions;
 
 #[derive(Row, Serialize)]
@@ -22,25 +22,27 @@ struct KafkaMessageInsert {
 
 pub struct Broker {
     client: Client,
-    consumer_group_cache: Arc<SharedConsumerGroupCache>,
+    consumer_group_cache: Arc<ConsumerGroups>,
 }
 
 impl Broker {
-    pub fn new() -> Arc<Self> {
+    pub fn new(clickhouse_url: String) -> Arc<Self> {
+        let client = Client::default()
+            .with_url(&clickhouse_url)
+            .with_option("async_insert", "1")
+            .with_option("wait_for_async_insert", "1");
+            
         // Initialize the shared consumer group cache
-        let consumer_group_cache = Arc::new(SharedConsumerGroupCache::new());
+        let consumer_group_cache = Arc::new(ConsumerGroups::new(client.clone()));
         
         Arc::new(Self {
-            client: Client::default()
-            .with_url("http://127.0.0.1:8123")
-            .with_option("async_insert", "1")
-            .with_option("wait_for_async_insert", "1"),
+            client,
             consumer_group_cache,
         })
     }
     
     // Get a reference to the consumer group cache
-    pub fn consumer_group_cache(&self) -> Arc<SharedConsumerGroupCache> {
+    pub fn consumer_group_cache(&self) -> Arc<ConsumerGroups> {
         self.consumer_group_cache.clone()
     }
 
@@ -100,10 +102,9 @@ impl Broker {
 
     pub async fn start(self: &Arc<Self>) -> Result<(), anyhow::Error> {
         // Start the consumer group cache worker
-        let clickhouse_url = "http://127.0.0.1:8123";
         let cache_clone = self.consumer_group_cache.clone();
         tokio::spawn(async move {
-            if let Err(e) = cache_clone.start_worker(clickhouse_url.to_string()).await {
+            if let Err(e) = cache_clone.start_worker().await {
                 error!("Failed to start consumer group cache worker: {}", e);
             }
         });

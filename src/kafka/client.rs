@@ -1,4 +1,5 @@
 use kafka_protocol::messages::api_versions_response::ApiVersion;
+use kafka_protocol::messages::join_group_response::JoinGroupResponseMember;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -8,6 +9,8 @@ use kafka_protocol::messages::*;
 use std::sync::{Arc, OnceLock};
 use anyhow;
 use log::{debug, info, error};
+use super::client_types::*;
+
 
 const MAX_MESSAGE_SIZE: i32 = 10_485_760; // 10MB
 
@@ -22,7 +25,7 @@ use super::protocol::{
     KafkaResponseMessage,
 };
 use super::Broker;
-use super::consumer_group::SharedConsumerGroupCache;
+use super::consumer_group::ConsumerGroups;
 
 static SUPPORTED_API_VERSIONS: OnceLock<Vec<ApiVersion>> = OnceLock::new();
 
@@ -58,7 +61,6 @@ fn init_api_versions() -> &'static Vec<ApiVersion> {
                 .with_api_key(ApiKey::JoinGroup as i16)
                 .with_min_version(0)
                 .with_max_version(9),
-            // Add more essential APIs
             ApiVersion::default()
                 .with_api_key(ApiKey::InitProducerId as i16)
                 .with_min_version(0)
@@ -100,23 +102,20 @@ fn init_api_versions() -> &'static Vec<ApiVersion> {
 }
 
 pub struct KafkaClient {
-    // Basic broker information
     pub(crate) broker_id: i32,
     pub(crate) cluster_id: String,
     pub(crate) controller_id: Option<i32>,
+    pub(crate) client_id: String,
+    pub(crate) client_host: String,
     
     // Topic metadata
     pub(crate) topics: HashMap<String, Vec<TopicPartition>>, // topic name -> partitions
-    
-    // Consumer group information
-    pub(crate) consumer_groups: HashMap<String, HashMap<String, i32>>, // group_id -> (member_id -> generation_id)
+
+    pub(crate) joined_groups: JoinedGroups,
     
     // Consumer group cache
-    pub(crate) consumer_group_cache: Arc<SharedConsumerGroupCache>,
-    
-    // Subscribed topics for each consumer group member
-    pub(crate) member_subscriptions: HashMap<String, Vec<String>>, // member_id -> [topic]
-    
+    pub(crate) consumer_group_cache: Arc<ConsumerGroups>,
+
     // Committed offsets
     pub(crate) committed_offsets: HashMap<String, HashMap<String, HashMap<i32, i64>>>, // group_id -> (topic -> (partition -> offset))
     
@@ -185,10 +184,11 @@ impl KafkaClient {
             broker_id: 0,
             cluster_id: "test-cluster".to_string(),
             controller_id: Some(0),
+            client_id: "".to_string(),
+            client_host: "".to_string(),
             topics: HashMap::new(),
-            consumer_groups: HashMap::new(),
+            joined_groups: HashMap::new(),
             consumer_group_cache,
-            member_subscriptions: HashMap::new(),
             committed_offsets: HashMap::new(),
             supported_api_versions: init_api_versions(),
             broker,
@@ -198,6 +198,7 @@ impl KafkaClient {
     pub async fn run(&mut self, tcp_stream: TcpStream) {
         let (mut tcp_reader, mut tcp_writer) = tcp_stream.into_split();
         let (request_tx, mut request_rx) = mpsc::channel::<KafkaRequestMessage>(100);
+        self.client_host = tcp_writer.peer_addr().map_or_else(|_| "".to_string(), |peer| peer.ip().to_string() + ":" + &peer.port().to_string());
         tokio::spawn(async move {
             if let Err(e) = read_loop(request_tx.clone(), &mut tcp_reader).await {
                 error!("Error in read loop: {:?}", e);
@@ -246,6 +247,9 @@ impl KafkaClient {
     }
 
     async fn handle_request(&mut self, request: KafkaRequestMessage) -> Result<KafkaResponseMessage, anyhow::Error> {
+        if self.client_id.is_empty() && request.header.client_id.is_some() {
+            self.client_id = request.header.client_id.clone().unwrap().to_string();
+        }
         let api_version = request.header.request_api_version;
         let (response, response_size) = match &request.request {
             RequestKind::ApiVersions(req) => handle_api_versions(self, req, api_version),

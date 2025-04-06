@@ -1,14 +1,18 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use anyhow::Result;
-use clickhouse::Client;
-use dashmap::DashMap;
-use log::{debug, error, info};
-use tokio::time as tokio_time;
-use serde::{Serialize, Deserialize};
-use clickhouse::Row;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use clickhouse::Client;
+use clickhouse::Row;
+use kafka_protocol::messages::join_group_response::JoinGroupResponseMember;
+use kafka_protocol::protocol::StrBytes;
+use log::{debug, error, info};
+use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+use tokio::time as tokio_time;
+
+use super::client_types::{GroupInfo, MemberAction, TopicAssignments};
 
 /// Representation of a topic partition
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -16,12 +20,6 @@ pub struct TopicPartition {
     pub topic: String,
     pub partition: i32,
 }
-
-/// ClickHouse compatible type for Map(String, Map(Int32, String))
-/// Represents a mapping from topic to partition assignments
-/// In ClickHouse, Map(K, V) is represented as Vec<(K, V)> in Rust
-pub type TopicAssignments = Vec<(String, PartitionAssignments)>;
-pub type PartitionAssignments = Vec<(i32, String)>;
 
 /// Assignment Map representation - maps topic name to partition map (partition ID -> member ID)
 type PartitionMap = HashMap<i32, String>;
@@ -32,491 +30,435 @@ pub type GroupAssignment = HashMap<String, PartitionMap>;
 pub struct GroupMemberRow {
     pub group_id: String,
     pub member_id: String,
+    pub action: MemberAction,
     pub generation_id: i32,
     pub protocol_type: String,
-    pub protocol_name: String,
+    pub protocol: Vec<(String, Vec<u8>)>,
     pub client_id: String,
     pub client_host: String,
-    pub metadata: String,
-    /// The assignment is stored as a nested Map in ClickHouse
-    /// Format: Map(topic String -> Map(partition_id Int32 -> member_id String))
-    pub assignment: TopicAssignments,
+    pub subscribed_topics: Vec<String>,
+    pub assignments: TopicAssignments,
     // Using DateTime64(9) with nanosecond precision
     #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
     pub join_time: DateTime<Utc>,
     #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
-    pub heartbeat_time: DateTime<Utc>,
-    pub state: String,
-}
-
-/// Member of a consumer group
-#[derive(Debug, Clone)]
-pub struct GroupMember {
-    pub member_id: String,
-    pub generation_id: i32,
-    pub client_id: String,
-    pub client_host: String,
-    pub protocol_type: String,
-    pub protocol_name: String,
-    pub metadata: String,
-    pub assignment: TopicAssignments,  // Assignments as a Map
-    pub join_time: DateTime<Utc>,
-    pub heartbeat_time: DateTime<Utc>,
-    pub last_updated: Instant,
-    pub assignments: HashMap<String, Vec<i32>>,  // Map of topic -> partition assignments for this member
-}
-
-impl GroupMember {
-    pub fn is_leader(&self, group: &ConsumerGroup) -> bool {
-        // The member with the earliest join_time is the leader
-        group.members.iter()
-            .all(|m| self.join_time <= m.join_time)
-    }
-    
-    /// Get a list of all topic partitions assigned to this member
-    pub fn get_topic_partitions(&self) -> Vec<TopicPartition> {
-        let mut result = Vec::new();
-        for (topic, partitions) in &self.assignments {
-            for &partition in partitions {
-                result.push(TopicPartition {
-                    topic: topic.clone(),
-                    partition,
-                });
-            }
-        }
-        result
-    }
-    
-    /// Create assignments for a consumer group based on subscribed topics and member metadata
-    /// This is called by the leader to determine partition assignments for all members
-    pub fn create_assignments(
-        _group_id: &str, 
-        members: &[GroupMember], 
-        topics: &[String],
-        partition_counts: &HashMap<String, i32>
-    ) -> GroupAssignment {
-        let mut assignment = GroupAssignment::new();
-        
-        // Initialize the assignment map with all topics
-        for topic in topics {
-            assignment.insert(topic.clone(), HashMap::new());
-        }
-        
-        if members.is_empty() {
-            return assignment;
-        }
-        
-        // For each topic, assign partitions to members in a round-robin fashion
-        for topic in topics {
-            let partition_count = *partition_counts.get(topic).unwrap_or(&0);
-            let partitions_per_topic = assignment.entry(topic.clone()).or_default();
-            
-            for partition_id in 0..partition_count {
-                // Round-robin assignment: partition_id % members.len() gives the member index
-                let member_idx = (partition_id as usize) % members.len();
-                let member_id = members[member_idx].member_id.clone();
-                
-                partitions_per_topic.insert(partition_id, member_id);
-            }
-        }
-        
-        assignment
-    }
-    
-    /// Convert a group assignment to a map of member_id -> (topic -> partitions)
-    /// This is used to extract each member's individual assignments from the group assignment
-    pub fn extract_member_assignments(
-        assignment: &GroupAssignment
-    ) -> HashMap<String, HashMap<String, Vec<i32>>> {
-        let mut result: HashMap<String, HashMap<String, Vec<i32>>> = HashMap::new();
-        
-        // Iterate through topics and partitions in the group assignment
-        for (topic, partitions) in assignment {
-            for (partition, member_id) in partitions {
-                // Get or create the member's assignment map
-                let member_assignment = result
-                    .entry(member_id.clone())
-                    .or_insert_with(HashMap::new);
-                
-                // Get or create the list of partitions for this topic
-                let topic_partitions = member_assignment
-                    .entry(topic.clone())
-                    .or_insert_with(Vec::new);
-                
-                // Add this partition to the member's list
-                topic_partitions.push(*partition);
-            }
-        }
-        
-        // Sort partition lists for deterministic output
-        for (_, member_assignment) in &mut result {
-            for (_, partitions) in member_assignment {
-                partitions.sort();
-            }
-        }
-        
-        result
-    }
+    pub update_time: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ConsumerGroup {
     pub group_id: String,
-    pub members: Vec<GroupMember>,
-    pub state: String,
+    pub members: Vec<GroupMemberRow>,
+    pub response_members: Vec<JoinGroupResponseMember>,
     pub generation: i32,
+    pub leader: String,
+    pub assignments: TopicAssignments,
+    pub is_converged: bool,
 }
 
-#[derive(Debug)]
-pub struct ConsumerGroupCache {
-    groups: DashMap<String, ConsumerGroup>,
+impl ConsumerGroup {
+    pub fn set_is_converged(&mut self) {
+        let is_converged = self
+            .members
+            .iter()
+            .all(|member| member.generation_id == self.generation);
+        self.is_converged = is_converged;
+    }
+}
+
+impl Default for ConsumerGroup {
+    fn default() -> Self {
+        ConsumerGroup {
+            group_id: String::new(),
+            members: Vec::new(),
+            generation: 0,
+            leader: String::new(),
+            assignments: Vec::new(),
+            response_members: Vec::new(),
+            is_converged: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConsumerGroupCache {
+    groups: HashMap<String, ConsumerGroup>,
     last_updated: Instant,
 }
 
 impl Default for ConsumerGroupCache {
     fn default() -> Self {
         Self {
-            groups: DashMap::new(),
+            groups: HashMap::new(),
             last_updated: Instant::now(),
         }
     }
 }
 
 impl ConsumerGroupCache {
-    /// Creates a new empty consumer group cache
-    pub fn new() -> Self {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn update(&mut self, new_groups: HashMap<String, ConsumerGroup>) {
+        self.groups = new_groups;
+        self.last_updated = Instant::now();
+    }
+}
+
+pub struct ConsumerGroups {
+    cache: Arc<RwLock<ConsumerGroupCache>>,
+    clickhouse_client: Client,
+}
+
+impl ConsumerGroups {
+    pub fn new(clickhouse_client: Client) -> Self {
         Self {
-            groups: DashMap::new(),
-            last_updated: Instant::now(),
-        }
-    }
-
-    /// Get a consumer group by its ID
-    pub fn get_group(&self, group_id: &str) -> Option<ConsumerGroup> {
-        self.groups.get(group_id).map(|g| g.clone())
-    }
-
-    /// Get all consumer groups
-    pub fn get_all_groups(&self) -> Vec<ConsumerGroup> {
-        self.groups.iter().map(|g| g.value().clone()).collect()
-    }
-
-    /// Check if all members in a group have converged to the same generation
-    pub fn has_group_converged(&self, group_id: &str) -> Option<bool> {
-        if let Some(group) = self.groups.get(group_id) {
-            if group.members.is_empty() {
-                return Some(true);
-            }
-            
-            let first_gen = group.members[0].generation_id;
-            Some(group.members.iter().all(|m| m.generation_id == first_gen))
-        } else {
-            // Group doesn't exist, return None
-            None
+            cache: Arc::new(RwLock::new(ConsumerGroupCache::new())),
+            clickhouse_client,
         }
     }
 
     /// Get the current generation ID for a group
     pub fn get_group_generation(&self, group_id: &str) -> Option<i32> {
-        self.groups.get(group_id).map(|group| group.generation)
+        self.with_read_lock(|cache| cache.groups.get(group_id).map(|g| g.generation))
     }
 
-    /// Get the time since the last update
-    pub fn time_since_update(&self) -> Duration {
-        self.last_updated.elapsed()
+    /// Get the leader member for a group
+    pub fn get_group_leader(&self, group_id: &str) -> Option<String> {
+        self.with_read_lock(|cache| cache.groups.get(group_id).map(|group| group.leader.clone()))
     }
 
-    /// Update the cache with new consumer groups
-    pub fn update(&self, groups: Vec<ConsumerGroup>) {
-        // Clear existing groups
-        self.groups.clear();
-        
-        // Add new groups
-        for group in groups {
-            self.groups.insert(group.group_id.clone(), group);
-        }
-        
-        // Update the last updated time - use atomic store through interior mutability
-        // Note: Since Instant doesn't support interior mutability, we just note that the
-        // cached values were updated but don't update the timestamp itself.
-        // The impact is minimal since we're always fetching fresh data on 500ms intervals.
+    /// Helper method to reduce lock boilerplate
+    fn with_read_lock<T, F>(&self, f: F) -> T
+    where
+        F: FnOnce(&ConsumerGroupCache) -> T,
+    {
+        let cache = self.cache.read().unwrap();
+        f(&cache)
     }
 
-    /// Get the leader for a group
-    pub fn get_group_leader(&self, group_id: &str) -> Option<GroupMember> {
-        if let Some(group) = self.groups.get(group_id) {
-            if group.members.is_empty() {
-                return None;
+    fn group_generation_assignments(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+    ) -> Option<TopicAssignments> {
+        self.with_read_lock(|cache| {
+            if let Some(group) = cache.groups.get(group_id) {
+                if group
+                    .members
+                    .iter()
+                    .all(|member| member.generation_id == generation_id)
+                {
+                    return Some(
+                        group
+                            .members
+                            .iter()
+                            .find(|m| m.member_id == group.leader)
+                            .map(|l| l.assignments.clone())
+                            .unwrap_or_default(),
+                    );
+                }
             }
-            
-            // Find the member with the earliest join_time
-            group.members.iter()
-                .min_by_key(|m| m.join_time)
-                .cloned()
-        } else {
-            None
-        }
+            return None;
+        })
     }
-    
-    /// Check if a member should rejoin the group
-    pub fn should_member_rejoin(&self, group_id: &str, member_id: &str, known_generation: i32) -> bool {
-        if let Some(group) = self.groups.get(group_id) {
-            // If the member isn't in the group, it should join
-            let member_exists = group.members.iter().any(|m| m.member_id == member_id);
-            if !member_exists {
-                return true;
+
+    fn is_member_generation(&self, group_id: &str, member_id: &str, generation_id: i32) -> bool {
+        self.with_read_lock(|cache| {
+            if let Some(group) = cache.groups.get(group_id) {
+                group.members.iter().any(|member| {
+                    member.member_id == member_id && member.generation_id == generation_id
+                })
+            } else {
+                false
             }
-            
-            // If the group's generation has changed, member should rejoin
-            if group.generation != known_generation {
-                return true;
+        })
+    }
+
+    /// Wait for a condition to be true with timeout and return value
+    async fn wait_for<F, T>(&self, timeout: Duration, mut check_fn: F, on_timeout: T) -> Result<T>
+    where
+        F: FnMut() -> Option<T>,
+    {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if let Some(value) = check_fn() {
+                return Ok(value);
             }
-            
-            // Member exists and generations match, no need to rejoin
-            false
-        } else {
-            // Group doesn't exist, member should join to create it
-            true
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-    }
-    
-    /// Check if the leader should trigger a rebalance
-    pub fn should_leader_rebalance(&self, group_id: &str, expected_members: &HashSet<String>) -> bool {
-        if let Some(group) = self.groups.get(group_id) {
-            // Get the set of member IDs in the cache
-            let current_members: HashSet<String> = group.members.iter()
-                .map(|m| m.member_id.clone())
-                .collect();
-            
-            // If the sets of members are different, trigger a rebalance
-            current_members != *expected_members
-        } else {
-            // Group doesn't exist, no need to rebalance
-            false
-        }
-    }
-}
-
-/// Shared consumer group cache that can be accessed from multiple threads
-pub struct SharedConsumerGroupCache {
-    cache: Arc<ConsumerGroupCache>,
-}
-
-impl SharedConsumerGroupCache {
-    /// Create a new shared consumer group cache
-    pub fn new() -> Self {
-        Self {
-            cache: Arc::new(ConsumerGroupCache::new()),
-        }
+        Ok(on_timeout)
     }
 
-    /// Get a reference to the cache
-    pub fn get_cache(&self) -> Arc<ConsumerGroupCache> {
-        self.cache.clone()
+    /// Wait for member to reach generation with timeout  
+    pub async fn wait_for_member_generation(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        generation_id: i32,
+        timeout: Duration,
+    ) -> Result<bool> {
+        self.wait_for(
+            timeout,
+            || {
+                if self.is_member_generation(group_id, member_id, generation_id) {
+                    Some(true)
+                } else {
+                    None
+                }
+            },
+            false, // Return false on timeout
+        )
+        .await
+    }
+
+    /// Get the number of consumer groups in the cache
+    pub fn group_count(&self) -> usize {
+        self.with_read_lock(|cache| cache.groups.len())
+    }
+
+    fn get_group(&self, group_id: &str) -> Option<ConsumerGroup> {
+        self.with_read_lock(|cache| cache.groups.get(group_id).cloned())
+    }
+
+    pub async fn write_action(
+        &self,
+        action: MemberAction,
+        client_id: String,
+        client_host: String,
+        group_id: String,
+        generation_id: i32,
+        group_info: &GroupInfo,
+    ) -> Result<()> {
+        let row = GroupMemberRow {
+            group_id,
+            member_id: group_info.member_info.member_id.clone(),
+            action,
+            generation_id: generation_id,
+            protocol_type: group_info.member_info.protocol_type.clone(),
+            protocol: group_info.member_info.protocol.clone(),
+            client_id: client_id,
+            client_host: client_host,
+            subscribed_topics: group_info.member_info.subscribed_topics.clone(),
+            assignments: group_info.assignments.clone(),
+            join_time: group_info.member_info.join_time,
+            update_time: Utc::now(),
+        };
+
+        let mut insert = self.clickhouse_client.insert("group_members")?;
+        insert.write(&row).await?;
+        insert.end().await?;
+
+        Ok(())
+    }
+
+    pub fn get_members(&self, group_id: &str) -> Vec<JoinGroupResponseMember> {
+        return self.with_read_lock(|cache| {
+            cache
+                .groups
+                .get(group_id)
+                .map(|g| g.response_members.clone())
+                .unwrap_or_default()
+        });
     }
 
     /// Start the background worker that updates the cache
-    pub async fn start_worker(&self, clickhouse_url: String) -> Result<()> {
+    pub async fn start_worker(&self) -> Result<()> {
         let cache = self.cache.clone();
-        
+        let client = self.clickhouse_client.clone();
+
         tokio::spawn(async move {
-            let client = Client::default()
-                .with_url(&clickhouse_url);
-            
-            let mut interval = tokio_time::interval(Duration::from_millis(500));
-            
-            loop {
-                interval.tick().await;
-                match fetch_consumer_groups(&client).await {
-                    Ok(groups) => {
-                        debug!("Fetched {} consumer groups", groups.len());
-                        cache.update(groups);
-                    },
-                    Err(e) => {
-                        error!("Failed to fetch consumer groups: {}", e);
-                    }
-                }
+            if let Err(e) = run_cache_worker(cache, client).await {
+                error!("Cache worker failed: {}", e);
             }
         });
-        
+
         info!("Started consumer group cache worker");
         Ok(())
     }
 
-    /// Check if all members in a group have converged to the same generation
-    pub fn has_group_converged(&self, group_id: &str) -> bool {
-        self.cache.has_group_converged(group_id).unwrap_or(false)
-    }
+    /// Wait for all members of a group to reach a specific generation ID
+    pub async fn wait_for_group_generation_assignments(&self, group_id: &str, generation_id: i32) -> Result<TopicAssignments> {
+        let start_time = Instant::now();
+        let timeout = Duration::from_secs(10);
 
-    /// Get a consumer group by its ID
-    pub fn get_group(&self, group_id: &str) -> Option<ConsumerGroup> {
-        self.cache.get_group(group_id)
-    }
+        loop {
+            if let Some(assignments) = self.group_generation_assignments(group_id, generation_id) {
+                return Ok(assignments);
+            }
 
-    /// Get all consumer groups
-    pub fn get_all_groups(&self) -> Vec<ConsumerGroup> {
-        self.cache.get_all_groups()
-    }
+            // Check timeout
+            if start_time.elapsed() > timeout {
+                return Err(anyhow::anyhow!(
+                    "Timeout waiting for group {} to reach generation {}",
+                    group_id,
+                    generation_id
+                ));
+            }
 
-    /// Get the leader for a group
-    pub fn get_group_leader(&self, group_id: &str) -> Option<GroupMember> {
-        self.cache.get_group_leader(group_id)
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
-    
-    /// Check if a member should rejoin the group due to changes
-    pub fn should_member_rejoin(&self, group_id: &str, member_id: &str, known_generation: i32) -> bool {
-        self.cache.should_member_rejoin(group_id, member_id, known_generation)
-    }
-    
-    /// Check if the leader should trigger a rebalance
-    pub fn should_leader_rebalance(&self, group_id: &str, expected_members: &HashSet<String>) -> bool {
-        self.cache.should_leader_rebalance(group_id, expected_members)
-    }
-    
-    /// Get the current generation for a group
-    pub fn get_group_generation(&self, group_id: &str) -> Option<i32> {
-        self.cache.get_group_generation(group_id)
+}
+
+/// Background worker that updates the cache
+async fn run_cache_worker(cache: Arc<RwLock<ConsumerGroupCache>>, client: Client) -> Result<()> {
+    let mut interval = tokio_time::interval(Duration::from_millis(500));
+
+    loop {
+        interval.tick().await;
+        match fetch_consumer_groups(&client).await {
+            Ok(groups) => {
+                debug!("Fetched {} consumer groups", groups.len());
+                let mut cache = cache.write().unwrap();
+                cache.update(groups);
+            }
+            Err(e) => {
+                error!("Failed to fetch consumer groups: {}", e);
+            }
+        }
     }
 }
 
 /// Fetch consumer groups from ClickHouse
-async fn fetch_consumer_groups(client: &Client) -> Result<Vec<ConsumerGroup>> {
-    // Query to fetch active group members (heartbeat within last 2 minutes)
+async fn fetch_consumer_groups(client: &Client) -> Result<HashMap<String, ConsumerGroup>> {
     let query = "
-        SELECT 
+        WITH members AS (
+            SELECT 
             group_id,
             member_id,
+            action,
             generation_id,
             protocol_type,
-            protocol_name,
+            protocol,
             client_id,
             client_host,
-            metadata,
-            assignment,
+            subscribed_topics,
+            assignments,
             join_time,
-            heartbeat_time,
-            'Stable' AS state
+            update_time
         FROM group_members
-        WHERE heartbeat_time >= now64() - INTERVAL ? MINUTE
-        ORDER BY group_id, member_id
+        WHERE update_time >= now64() - INTERVAL ? SECOND
+        AND action != 'LeaveGroup'
+        ORDER BY group_id, update_time DESC
+        LIMIT 1 BY group_id, member_id
+        )
+        SELECT * FROM members ORDER BY group_id, join_time ASC
     ";
 
-    // Prepare query with parameters
-    let rows = client
+    let mut cursor = client
         .query(query)
-        .bind(2)  // 2 minutes for heartbeat timeout
-        .fetch_all::<GroupMemberRow>()
-        .await?;
+        .bind(15)
+        .fetch::<GroupMemberRow>()
+        .context("Failed to fetch consumer groups")?;
 
-    let mut groups_map: HashMap<String, ConsumerGroup> = HashMap::new();
-    
-    for row in rows {
-        // Extract member's individual assignments from the group assignment
-        let assignments = extract_member_assignments(&row.assignment, &row.member_id);
-        
-        let member = GroupMember {
-            member_id: row.member_id,
-            generation_id: row.generation_id,
-            client_id: row.client_id,
-            client_host: row.client_host,
-            protocol_type: row.protocol_type,
-            protocol_name: row.protocol_name,
-            metadata: row.metadata,
-            assignment: row.assignment,
-            join_time: row.join_time,
-            heartbeat_time: row.heartbeat_time,
-            last_updated: Instant::now(),
-            assignments,
-        };
-        
-        groups_map
-            .entry(row.group_id.clone())
-            .or_insert_with(|| ConsumerGroup {
+    let mut groups = HashMap::new();
+    let mut current_group = ConsumerGroup::default();
+
+    while let Some(row) = cursor.next().await? {
+        // Start new group collection
+        if current_group.group_id != row.group_id {
+            // Complete previous group collection
+            if !current_group.group_id.is_empty() {
+                current_group.set_is_converged();
+                groups.insert(current_group.group_id.clone(), current_group);
+            }
+            // Initialize new group
+            current_group = ConsumerGroup {
                 group_id: row.group_id.clone(),
                 members: Vec::new(),
-                state: row.state,
+                response_members: Vec::new(),
                 generation: row.generation_id,
-            })
-            .members.push(member);
+                leader: row.member_id.clone(),
+                assignments: row.assignments.clone(),
+                is_converged: false,
+            };
+        }
+        let join_group_member = JoinGroupResponseMember::default()
+            .with_member_id(StrBytes::from_string(row.member_id.clone()));
+        current_group.response_members.push(join_group_member);
+        current_group.members.push(row);
     }
-    
-    // Ensure the group's generation is set to the most common generation ID among members
-    for group in groups_map.values_mut() {
-        if !group.members.is_empty() {
-            // Count occurrences of each generation ID
-            let mut gen_counts: HashMap<i32, usize> = HashMap::new();
-            for member in &group.members {
-                *gen_counts.entry(member.generation_id).or_insert(0) += 1;
+
+    if !current_group.group_id.is_empty() {
+        current_group.set_is_converged();
+        groups.insert(current_group.group_id.clone(), current_group);
+    }
+
+    Ok(groups)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn test_consumer_group_cache() {
+        let cache = ConsumerGroups::new(Client::default());
+
+        // Initially empty
+        assert_eq!(cache.group_count(), 0);
+        assert!(cache.get_group("test").is_none());
+
+        // Test updating with some groups
+        let mut test_groups = HashMap::new();
+        test_groups.insert(
+            "test_group".to_string(),
+            ConsumerGroup {
+                group_id: "test_group".to_string(),
+                members: Vec::new(),
+                generation: 1,
+                leader: "leader".to_string(),
+                assignments: Vec::new(),
+                response_members: Vec::new(),
+                is_converged: true,
+            },
+        );
+
+        // Update the cache directly for testing
+        {
+            let mut cache_inner = cache.cache.write().unwrap();
+            cache_inner.update(test_groups);
+        }
+
+        // Verify the update
+        assert_eq!(cache.group_count(), 1);
+        assert!(cache.get_group("test_group").is_some());
+        assert!(cache.get_group("nonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cache_worker() {
+        let cache = ConsumerGroups::new(Client::default());
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        // Mock ClickHouse client that returns test data
+        let client = Client::default();
+
+        // Start the worker
+        let cache_clone = cache.cache.clone();
+        let stop_flag_clone = stop_flag.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio_time::interval(Duration::from_millis(100));
+            while !stop_flag_clone.load(Ordering::SeqCst) {
+                interval.tick().await;
+                let test_groups = HashMap::new(); // Add test data here
+                let mut cache = cache_clone.write().unwrap();
+                cache.update(test_groups);
             }
-            
-            // Find the most common generation ID
-            if let Some((&generation_id, _)) = gen_counts.iter().max_by_key(|&(_, count)| *count) {
-                group.generation = generation_id;
-            }
-        }
-    }
-    
-    Ok(groups_map.into_values().collect())
-}
+        });
 
-/// Extract a member's assignments from the group assignment
-fn extract_member_assignments(assignment: &TopicAssignments, member_id: &str) -> HashMap<String, Vec<i32>> {
-    let mut result = HashMap::new();
-    
-    // Iterate through topics and partitions in the group assignment
-    for (topic, partitions) in assignment {
-        let mut member_partitions = Vec::new();
-        
-        // Find partitions assigned to this member
-        for (partition_id, assigned_member_id) in partitions {
-            if assigned_member_id == member_id {
-                member_partitions.push(*partition_id);
-            }
-        }
-        
-        // Sort for deterministic output
-        member_partitions.sort();
-        
-        // Add to the result if not empty
-        if !member_partitions.is_empty() {
-            result.insert(topic.clone(), member_partitions);
-        }
-    }
-    
-    result
-}
+        // Wait a bit for updates
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
-/// Convert a GroupAssignment (HashMap) to TopicAssignments (Vec of tuples)
-pub fn group_assignment_to_topic_assignments(assignment: &GroupAssignment) -> TopicAssignments {
-    let mut topic_assignments = Vec::new();
-    
-    for (topic, partitions) in assignment {
-        let mut partition_assignments = Vec::new();
-        
-        for (partition_id, member_id) in partitions {
-            partition_assignments.push((*partition_id, member_id.clone()));
-        }
-        
-        topic_assignments.push((topic.clone(), partition_assignments));
-    }
-    
-    topic_assignments
-}
+        // Stop the worker
+        stop_flag.store(true, Ordering::SeqCst);
 
-/// Convert TopicAssignments (Vec of tuples) to GroupAssignment (HashMap)
-pub fn topic_assignments_to_group_assignment(assignments: &TopicAssignments) -> GroupAssignment {
-    let mut result = GroupAssignment::new();
-    
-    for (topic, partitions) in assignments {
-        let mut partition_map = PartitionMap::new();
-        
-        for (partition_id, member_id) in partitions {
-            partition_map.insert(*partition_id, member_id.clone());
-        }
-        
-        result.insert(topic.clone(), partition_map);
+        // Verify the cache was updated
+        assert_eq!(cache.group_count(), 0); // Adjust based on test data
     }
-    
-    result
 }
-

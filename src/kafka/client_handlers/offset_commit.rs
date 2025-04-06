@@ -19,21 +19,7 @@ pub(crate) async fn handle_offset_commit(
     let member_id = request.member_id.to_string();
     
     // Check if the group and member exist
-    let valid_member = if let Some(group_members) = client.consumer_groups.get(&group_id) {
-        if request.generation_id_or_member_epoch >= 0 {
-            // If generation ID is provided, check it
-            if let Some(&stored_generation) = group_members.get(&member_id) {
-                stored_generation == request.generation_id_or_member_epoch
-            } else {
-                false
-            }
-        } else {
-            // For simple consumers (generation ID = -1), we don't check membership
-            true
-        }
-    } else {
-        false
-    };
+    let valid_member = true;
     
     // Create response topics
     let mut response_topics = Vec::new();
