@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use kafka_protocol::messages::{ProduceRequest, ProduceResponse};
@@ -20,23 +22,48 @@ struct KafkaMessageInsert {
     value: String,
 }
 
+struct ClickHouseClients {
+    clients: Vec<Client>,
+    next_idx: AtomicUsize,
+}
+
+impl ClickHouseClients {
+    fn new(urls: &str) -> Self {
+        let clients = urls.split(',')
+            .map(|url| Client::default()
+                .with_url(url.trim())
+                .with_option("async_insert", "1")
+                .with_option("wait_for_async_insert", "1"))
+            .collect();
+        Self { 
+            clients,
+            next_idx: AtomicUsize::new(0),
+        }
+    }
+
+    fn get(&self) -> &Client {
+        if self.clients.is_empty() {
+            panic!("No ClickHouse clients available");
+        }
+        let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % self.clients.len();
+        &self.clients[idx]
+    }
+}
+
 pub struct Broker {
-    client: Client,
+    clients: ClickHouseClients,
     consumer_group_cache: Arc<ConsumerGroups>,
 }
 
 impl Broker {
     pub fn new(clickhouse_url: String) -> Arc<Self> {
-        let client = Client::default()
-            .with_url(&clickhouse_url)
-            .with_option("async_insert", "1")
-            .with_option("wait_for_async_insert", "1");
-            
-        // Initialize the shared consumer group cache
-        let consumer_group_cache = Arc::new(ConsumerGroups::new(client.clone()));
+        let clients = ClickHouseClients::new(&clickhouse_url);
+        
+        // Initialize the shared consumer group cache using first client
+        let consumer_group_cache = Arc::new(ConsumerGroups::new(clients.get().clone()));
         
         Arc::new(Self {
-            client,
+            clients,
             consumer_group_cache,
         })
     }
@@ -46,8 +73,12 @@ impl Broker {
         self.consumer_group_cache.clone()
     }
 
+    pub fn get_client(&self) -> &Client {
+        self.clients.get()
+    }
+
     pub async fn produce(&self, mut req: ProduceRequest) -> Result<ProduceResponse, anyhow::Error> {
-        let mut insert = self.client.insert("kafka_messages_ingest")?;
+        let mut insert = self.clients.get().insert("kafka_messages_ingest")?;
         let mut message_count = 0;
         
         // Process all topics and partitions
@@ -153,7 +184,7 @@ impl Broker {
         debug!("Executing ClickHouse query: {}", query);
         
         // Execute the query
-        let mut query_builder = self.client.query(&query);
+        let mut query_builder = self.clients.get().query(&query);
         
         // Bind all parameters in order
         for topic_partitions in topics_partitions {
@@ -171,7 +202,7 @@ impl Broker {
 
     pub async fn get_latest_offset(&self, topic: &str, partition: i32) -> Result<i64, anyhow::Error> {
         let query = "SELECT max(offset) as max_offset FROM kafka_messages WHERE topic = ? AND partition = ?";
-        let result: Option<i64> = self.client.query(query)
+        let result: Option<i64> = self.clients.get().query(query)
             .bind(topic)
             .bind(partition)
             .fetch_optional()
@@ -182,7 +213,7 @@ impl Broker {
 
     pub async fn get_earliest_offset(&self, topic: &str, partition: i32) -> Result<i64, anyhow::Error> {
         let query = "SELECT min(offset) as min_offset FROM kafka_messages WHERE topic = ? AND partition = ?";
-        let result: Option<i64> = self.client.query(query)
+        let result: Option<i64> = self.clients.get().query(query)
             .bind(topic)
             .bind(partition)
             .fetch_optional()
@@ -193,7 +224,7 @@ impl Broker {
 
     pub async fn get_offset_at_time(&self, topic: &str, partition: i32, timestamp: i64) -> Result<i64, anyhow::Error> {
         let query = "SELECT min(offset) as offset FROM kafka_messages WHERE topic = ? AND partition = ? AND ts >= fromUnixTimestamp64Milli(?)";
-        let result: Option<i64> = self.client.query(query)
+        let result: Option<i64> = self.clients.get().query(query)
             .bind(topic)
             .bind(partition)
             .bind(timestamp)

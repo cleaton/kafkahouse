@@ -31,17 +31,20 @@ pub(crate) async fn handle_heartbeat(
     let mut error_code = if current_generation != generation_id {
         debug!("Member {} has outdated generation {} (current is {}), requesting rejoin",
                member_id, generation_id, current_generation);
-        16 // REBALANCE_IN_PROGRESS
+        27 // REBALANCE_IN_PROGRESS
     } else {
         0 // SUCCESS
     };
 
 
-    if (leader == member_id) {
+    if leader == member_id {
         if let Some(group_info) = client.joined_groups.get(&group_id) {
             let members = client.consumer_group_cache.get_members(&group_id);
+            info!("Current members in group {}: {:?}", group_id, members);
+            info!("in group_info {}: {:?}", group_id, group_info.members);
             if group_info.should_rebalance(&members) {
-                error_code = 16;
+                info!("!!!!!! SHOULD REBALANCE !!!!!!!");
+                error_code = 27;
             }
         }
     }

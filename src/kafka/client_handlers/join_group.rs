@@ -3,9 +3,9 @@ use kafka_protocol::messages::*;
 use kafka_protocol::messages::join_group_response::JoinGroupResponse;
 use kafka_protocol::protocol::{Encodable, StrBytes};
 use log::{debug, info};
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use crate::kafka::client_types::*;
 
@@ -143,6 +143,20 @@ pub(crate) async fn handle_join_group(
 
     group_info.members = members.clone();
     
+    // Build member list with metadata
+    let members = if member_id == leader {
+        members.into_iter().map(|m| {
+            let metadata = if let Some(protocol) = request.protocols.first() {
+                protocol.metadata.clone()
+            } else {
+                Bytes::new()
+            };
+            m.with_metadata(metadata)
+        }).collect()
+    } else {
+        Vec::new() // Non-leaders get empty member list
+    };
+    
     // Create the response
     let response = JoinGroupResponse::default()
         .with_throttle_time_ms(0)
@@ -152,7 +166,10 @@ pub(crate) async fn handle_join_group(
         .with_protocol_name(request.protocols.first().map(|p| p.name.clone()))
         .with_leader(StrBytes::from_string(leader))
         .with_member_id(StrBytes::from_string(member_id))
-        .with_members(members);
+        .with_members(members)
+        .with_unknown_tagged_fields(BTreeMap::new());  // Required for v5
+    
+    debug!("JoinGroup response: {:?}", response);
     
     // Compute response size
     let response_size = response.compute_size(api_version)? as i32;
