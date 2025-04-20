@@ -4,9 +4,9 @@ use kafka_protocol::messages::ResponseKind;
 use kafka_protocol::protocol::Encodable;
 use log::info;
 
-use crate::kafka::client::KafkaClient;
+use crate::kafka::client_actor::ClientState;
 pub(crate) async fn handle_produce(
-    client: &mut KafkaClient,
+    client: &mut ClientState,
     request: &ProduceRequest,
     api_version: i16,
 ) -> Result<(ResponseKind, i32), anyhow::Error> {

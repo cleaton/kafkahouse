@@ -5,10 +5,10 @@ use kafka_protocol::protocol::Encodable;
 use log::{debug, info};
 use std::collections::HashMap;
 
-use crate::kafka::client::KafkaClient;
+use crate::kafka::client_actor::ClientState;
 
 pub(crate) async fn handle_offset_commit(
-    client: &mut KafkaClient,
+    client: &mut ClientState,
     request: &OffsetCommitRequest,
     api_version: i16,
 ) -> Result<(ResponseKind, i32), anyhow::Error> {
@@ -16,7 +16,6 @@ pub(crate) async fn handle_offset_commit(
           request.group_id, request.member_id, request.generation_id_or_member_epoch);
     
     let group_id = request.group_id.0.to_string();
-    let member_id = request.member_id.to_string();
     
     // Check if the group and member exist
     let valid_member = true;

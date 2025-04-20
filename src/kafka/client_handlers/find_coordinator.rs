@@ -1,40 +1,35 @@
 use kafka_protocol::messages::*;
-use kafka_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
+use kafka_protocol::messages::find_coordinator_response::{Coordinator, FindCoordinatorResponse};
 use kafka_protocol::protocol::{Encodable, StrBytes};
-use crate::kafka::client::KafkaClient;
-use log::debug;
+use log::info;
 
-pub(crate) fn handle_find_coordinator(
-    client: &KafkaClient, 
-    request: &FindCoordinatorRequest, 
-    api_version: i16
-) -> Result<(ResponseKind, i32), anyhow::Error> {
-    debug!("Handling FindCoordinator request: {:?}", request);
+use crate::kafka::client_actor::ClientState;
+
+pub(crate) fn handle_find_coordinator(client: &ClientState, request: &FindCoordinatorRequest, api_version: i16) -> Result<(ResponseKind, i32), anyhow::Error> {
+    info!("Handling FindCoordinator request: key={:?}, key_type={:?}", request.key, request.key_type);
     
-    let mut response = FindCoordinatorResponse::default()
-        .with_throttle_time_ms(0)
-        .with_error_code(0);
+    // For simplicity, we'll return this broker as the coordinator for all keys
+    let coordinator = Coordinator::default()
+        .with_node_id(BrokerId(client.broker_id))
+        .with_host(StrBytes::from_string("127.0.0.1".to_string()))
+        .with_port(9092);
     
-    // For older versions (v0-v3)
-    if api_version <= 3 {
+    let mut response = FindCoordinatorResponse::default();
+    
+    // Kafka API v >= 1 can return multiple coordinators
+    if api_version >= 1 {
+        response.coordinators = vec![coordinator];
+    } else {
         response.node_id = BrokerId(client.broker_id);
         response.host = StrBytes::from_string("127.0.0.1".to_string());
         response.port = 9092;
-    } else {
-        // For v4+, we need to use the coordinators field
-        let coordinator = find_coordinator_response::Coordinator::default()
-            .with_key(request.key.clone())
-            .with_node_id(BrokerId(client.broker_id))
-            .with_host(StrBytes::from_string("127.0.0.1".to_string()))
-            .with_port(9092)
-            .with_error_code(0)
-            .with_error_message(None);
-        
-        response.coordinators = vec![coordinator];
     }
     
+    response.error_code = 0; // SUCCESS
+    response.error_message = None;
+    
+    // Compute response size
     let response_size = response.compute_size(api_version)? as i32;
-    debug!("FindCoordinator response size: {} bytes", response_size);
     
     Ok((ResponseKind::FindCoordinator(response), response_size))
 }

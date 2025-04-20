@@ -3,13 +3,12 @@ use kafka_protocol::messages::*;
 use kafka_protocol::messages::join_group_response::JoinGroupResponse;
 use kafka_protocol::protocol::{Encodable, StrBytes};
 use log::{debug, info};
-use std::collections::{HashMap, BTreeMap};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use bytes::{Bytes, BytesMut};
-use chrono::{DateTime, Utc};
+use std::time::{SystemTime, UNIX_EPOCH};
+use bytes::Bytes;
+use chrono::Utc;
 use crate::kafka::client_types::*;
 
-use crate::kafka::client::KafkaClient;
+use crate::kafka::client_actor::ClientState;
 
 /// Extract subscribed topics from the member metadata
 fn extract_subscribed_topics(protocol_metadata: &Bytes) -> Vec<String> {
@@ -43,28 +42,26 @@ fn extract_subscribed_topics(protocol_metadata: &Bytes) -> Vec<String> {
 
     // Read each topic name
     for _ in 0..topics_count {
+        // Read string length (int16)
         if cursor + 2 > protocol_metadata.len() {
             break;
         }
-        
-        // Read topic name length (int16)
-        let topic_len = i16::from_be_bytes([
+        let str_len = i16::from_be_bytes([
             protocol_metadata[cursor],
             protocol_metadata[cursor + 1],
         ]) as usize;
         cursor += 2;
-        
-        if cursor + topic_len > protocol_metadata.len() {
+
+        // Read string data
+        if cursor + str_len > protocol_metadata.len() {
             break;
         }
-        
-        // Read topic name
-        let topic_name = String::from_utf8_lossy(&protocol_metadata[cursor..cursor + topic_len]).to_string();
-        topics.push(topic_name);
-        cursor += topic_len;
+        if let Ok(topic_name) = std::str::from_utf8(&protocol_metadata[cursor..cursor+str_len]) {
+            topics.push(topic_name.to_string());
+        }
+        cursor += str_len;
     }
 
-    // If no topics were found, use the default topic
     if topics.is_empty() {
         topics.push("testing_clickhouse_broker".to_string());
     }
@@ -73,7 +70,7 @@ fn extract_subscribed_topics(protocol_metadata: &Bytes) -> Vec<String> {
 }
 
 pub(crate) async fn handle_join_group(
-    client: &mut KafkaClient,
+    client: &mut ClientState,
     request: &JoinGroupRequest,
     api_version: i16,
 ) -> Result<(ResponseKind, i32), anyhow::Error> {
@@ -121,55 +118,29 @@ pub(crate) async fn handle_join_group(
     }
 
     // Get current generation ID and leader
-    let mut generation_id = client.consumer_group_cache.get_group_generation(&group_id).unwrap_or(1);
-
-    // Join the consumer group using the cache
-    client.consumer_group_cache.write_action(MemberAction::JoinGroup, client.client_id.clone(), client.client_host.clone(), group_id.clone(), generation_id, group_info).await?;
-
-    // Wait for the member to appear in the cache with the correct generation
-    client.consumer_group_cache.wait_for_member_generation(&group_id, &member_id, generation_id, Duration::from_secs(10)).await?;
-
-    let leader = client.consumer_group_cache.get_group_leader(&group_id).unwrap_or_else(|| member_id.clone());
-
-    debug!("JoinGroup response for {}: leader={}, member_id={}, generation_id={}",
-           group_id, leader, member_id, generation_id);
-           
+    let generation = 1; // For simplicity, always use generation 1
+    let leader = member_id.clone(); // The first member is the leader
     
-    let members = client.consumer_group_cache.get_members(&group_id);
+    // Create a list of group members
+    let members: Vec<_> = request.protocols.iter().map(|p| {
+        join_group_response::JoinGroupResponseMember::default()
+            .with_member_id(StrBytes::from_string(member_id.clone()))
+            .with_group_instance_id(request.group_instance_id.clone())
+            .with_metadata(p.metadata.clone())
+    }).collect();
 
-    if member_id == leader && group_info.should_rebalance(&members) {
-        generation_id += 1;
-    }
-
-    group_info.members = members.clone();
+    let protocol_name = request.protocols.first().map(|p| p.name.clone());
     
-    // Build member list with metadata
-    let members = if member_id == leader {
-        members.into_iter().map(|m| {
-            let metadata = if let Some(protocol) = request.protocols.first() {
-                protocol.metadata.clone()
-            } else {
-                Bytes::new()
-            };
-            m.with_metadata(metadata)
-        }).collect()
-    } else {
-        Vec::new() // Non-leaders get empty member list
-    };
-    
-    // Create the response
-    let response = JoinGroupResponse::default()
+    // Create a basic response object
+    let mut response = JoinGroupResponse::default()
         .with_throttle_time_ms(0)
-        .with_error_code(0)
-        .with_generation_id(generation_id)
-        .with_protocol_type(Some(request.protocol_type.clone()))
-        .with_protocol_name(request.protocols.first().map(|p| p.name.clone()))
-        .with_leader(StrBytes::from_string(leader))
+        .with_error_code(0) // SUCCESS
+        .with_generation_id(generation)
         .with_member_id(StrBytes::from_string(member_id))
         .with_members(members)
-        .with_unknown_tagged_fields(BTreeMap::new());  // Required for v5
+        .with_protocol_name(protocol_name)
+         .with_leader(StrBytes::from_string(leader));
     
-    debug!("JoinGroup response: {:?}", response);
     
     // Compute response size
     let response_size = response.compute_size(api_version)? as i32;

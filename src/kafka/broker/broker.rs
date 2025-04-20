@@ -8,11 +8,13 @@ use kafka_protocol::messages::produce_response::{TopicProduceResponse, Partition
 use clickhouse::{Client, Row};
 use kafka_protocol::records::{RecordBatchDecoder, Compression};
 use log::{info, debug, error};
+use ractor::Actor;
 use serde::Serialize;
 use tokio::net::TcpListener;
 
-use crate::kafka::client::KafkaClient;
+use crate::kafka::client_actor::Args;
 use crate::kafka::consumer_group::ConsumerGroups;
+use crate::kafka::ClientActor;
 use super::types::TopicPartitions;
 
 #[derive(Row, Serialize)]
@@ -149,12 +151,11 @@ impl Broker {
 
             // Clone the Arc for this client
             let broker_clone = Arc::clone(self);
-            
-            // Spawn a new task for each client
-            tokio::spawn(async move {
-                let mut client = KafkaClient::new(broker_clone);
-                client.run(socket).await;
-            });
+
+            let (_actor, _handle) = Actor::spawn(None, ClientActor, Args{
+                broker: broker_clone,
+                tcp_stream: socket
+            }).await?;
         }
     }
 

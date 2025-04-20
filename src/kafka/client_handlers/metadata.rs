@@ -1,11 +1,11 @@
 use kafka_protocol::messages::*;
 use kafka_protocol::messages::metadata_response::{MetadataResponse, MetadataResponseBroker, MetadataResponseTopic};
 use kafka_protocol::protocol::{Encodable, StrBytes};
-use crate::kafka::client::{KafkaClient, TopicPartition};
+use crate::kafka::client_actor::{ClientState, TopicPartition};
 use log::{debug, info};
 use std::collections::HashMap;
 
-pub(crate) fn handle_metadata(client: &mut KafkaClient, request: &MetadataRequest, _api_version: i16) -> Result<(ResponseKind, i32), anyhow::Error> {
+pub(crate) fn handle_metadata(client: &mut ClientState, request: &MetadataRequest, _api_version: i16) -> Result<(ResponseKind, i32), anyhow::Error> {
     debug!("Handling metadata request: {:?}", request);
     
     let mut response = MetadataResponse::default();

@@ -1,10 +1,10 @@
 use kafka_protocol::messages::*;
 use kafka_protocol::messages::api_versions_response::ApiVersionsResponse;
 use kafka_protocol::protocol::Encodable;
-use crate::kafka::client::KafkaClient;
+use crate::kafka::client_actor::ClientState;
 use log::debug;
 
-pub(crate) fn handle_api_versions(client: &KafkaClient, _request: &ApiVersionsRequest, api_version: i16) -> Result<(ResponseKind, i32), anyhow::Error> {
+pub(crate) fn handle_api_versions(client: &ClientState, _request: &ApiVersionsRequest, api_version: i16) -> Result<(ResponseKind, i32), anyhow::Error> {
 
     let mut response = ApiVersionsResponse::default();
     response.error_code = 0;

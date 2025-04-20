@@ -4,10 +4,10 @@ use kafka_protocol::messages::offset_fetch_response::{OffsetFetchResponse, Offse
 use kafka_protocol::protocol::{Encodable, StrBytes};
 use log::info;
 
-use crate::kafka::client::KafkaClient;
+use crate::kafka::client_actor::ClientState;
 
 pub(crate) async fn handle_offset_fetch(
-    client: &mut KafkaClient,
+    client: &mut ClientState,
     request: &OffsetFetchRequest,
     api_version: i16,
 ) -> Result<(ResponseKind, i32), anyhow::Error> {
