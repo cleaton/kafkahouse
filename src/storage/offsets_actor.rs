@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
+use ractor::RpcReplyPort;
 
 struct OffsetsActor;
 

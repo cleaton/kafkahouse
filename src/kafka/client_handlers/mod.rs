@@ -12,7 +12,6 @@ mod offset_commit;
 mod offset_fetch;
 // Add more handler modules as needed
 
-pub(crate) use api_versions::handle_api_versions;
 pub(crate) use metadata::handle_metadata;
 pub(crate) use produce::handle_produce;
 pub(crate) use fetch::handle_fetch;

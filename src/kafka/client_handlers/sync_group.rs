@@ -1,15 +1,10 @@
-use anyhow::anyhow;
 use anyhow::Result;
-use bytes::Bytes;
 use kafka_protocol::messages::*;
 use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
 use kafka_protocol::protocol::Encodable;
-use kafka_protocol::protocol::StrBytes;
-use log::{debug, info};
-use std::collections::BTreeMap;
+use log::info;
 
 use crate::kafka::client_actor::ClientState;
-use crate::kafka::client_types::*;
 
 
 pub(crate) async fn handle_sync_group(

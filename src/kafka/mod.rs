@@ -7,4 +7,4 @@ pub mod client_actor;
 pub mod consumer_groups_actor;
 
 pub use broker::Broker;
-pub use client_actor::{ClientActor, ClientState};
+pub use client_actor::ClientActor;

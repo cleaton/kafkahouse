@@ -1,7 +1,7 @@
 use anyhow::Result;
 use kafka_protocol::messages::*;
 use kafka_protocol::messages::list_offsets_response::{ListOffsetsResponse, ListOffsetsTopicResponse, ListOffsetsPartitionResponse};
-use kafka_protocol::protocol::{Encodable, StrBytes};
+use kafka_protocol::protocol::Encodable;
 use log::info;
 
 use crate::kafka::client_actor::ClientState;

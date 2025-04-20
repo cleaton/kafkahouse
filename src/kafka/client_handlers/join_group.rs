@@ -132,7 +132,7 @@ pub(crate) async fn handle_join_group(
     let protocol_name = request.protocols.first().map(|p| p.name.clone());
     
     // Create a basic response object
-    let mut response = JoinGroupResponse::default()
+    let response = JoinGroupResponse::default()
         .with_throttle_time_ms(0)
         .with_error_code(0) // SUCCESS
         .with_generation_id(generation)

@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use anyhow;
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use kafka_protocol::messages::*;
 use kafka_protocol::messages::api_versions_response::ApiVersion;
 use kafka_protocol::protocol::Encodable;
 use log::{debug, error, info};
-use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
+use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{tcp::{OwnedReadHalf, OwnedWriteHalf}, TcpStream};
 

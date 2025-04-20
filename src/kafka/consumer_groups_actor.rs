@@ -1,4 +1,4 @@
-use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
+use ractor::{Actor, ActorProcessingErr, ActorRef};
 
 struct ConsumerGroupsActor;
 

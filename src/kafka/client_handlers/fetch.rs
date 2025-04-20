@@ -1,7 +1,7 @@
 use anyhow::Result;
 use kafka_protocol::messages::*;
 use kafka_protocol::messages::fetch_response::{FetchResponse, FetchableTopicResponse, PartitionData};
-use kafka_protocol::protocol::{Encodable, StrBytes};
+use kafka_protocol::protocol::Encodable;
 use log::{debug, info};
 
 use crate::kafka::client_actor::ClientState;
