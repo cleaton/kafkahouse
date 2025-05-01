@@ -4,7 +4,7 @@ mod storage;
 use crate::kafka::Broker;
 use log::info;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 

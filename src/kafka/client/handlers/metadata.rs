@@ -1,48 +1,62 @@
+use anyhow::Result;
 use kafka_protocol::messages::*;
 use kafka_protocol::messages::metadata_response::{MetadataResponse, MetadataResponseBroker, MetadataResponseTopic};
 use kafka_protocol::protocol::{Encodable, StrBytes};
-use crate::kafka::client_actor::{ClientState, TopicPartition};
+use crate::kafka::client::types::{ClientState, TopicPartition};
 use log::{debug, info};
 use std::collections::HashMap;
 
-pub(crate) fn handle_metadata(client: &mut ClientState, request: &MetadataRequest, _api_version: i16) -> Result<(ResponseKind, i32), anyhow::Error> {
-    debug!("Handling metadata request: {:?}", request);
+use crate::kafka::protocol::{KafkaRequestMessage, KafkaResponseMessage};
+
+pub(crate) async fn handle_metadata(state: &mut ClientState, request: KafkaRequestMessage) 
+    -> Result<KafkaResponseMessage, anyhow::Error> {
+    
+    let api_version = request.header.request_api_version;
+    
+    // Extract the MetadataRequest from the request
+    let metadata_request = if let RequestKind::Metadata(req) = request.request {
+        req
+    } else {
+        return Err(anyhow::anyhow!("Expected Metadata request"));
+    };
+    
+    debug!("Handling metadata request: {:?}", metadata_request);
     
     let mut response = MetadataResponse::default();
     
     // Add broker information
     response.brokers = vec![
         MetadataResponseBroker::default()
-            .with_node_id(BrokerId(client.broker_id))
+            .with_node_id(BrokerId(state.broker_id))
             .with_host(StrBytes::from_string("127.0.0.1".to_string()))
             .with_port(9092)
             .with_rack(None)
     ];
 
     // Set cluster information
-    response.cluster_id = Some(StrBytes::from_string(client.cluster_id.to_string()));
-    response.controller_id = BrokerId(client.controller_id.unwrap_or(-1));
+    response.cluster_id = Some(StrBytes::from_string(state.cluster_id.to_string()));
+    response.controller_id = BrokerId(state.controller_id.unwrap_or(-1));
     response.throttle_time_ms = 0;
 
     // Auto-create topics if they don't exist
     let mut created_topics = HashMap::new();
-    if let Some(topics) = &request.topics {
+    if let Some(topics) = &metadata_request.topics {
         for topic in topics {
             if let Some(topic_name) = &topic.name {
                 let name = topic_name.0.to_string();
-                if !client.topics.contains_key(&name) && !name.is_empty() {
+                if !state.topics.contains_key(&name) && !name.is_empty() {
                     info!("Auto-creating topic: {}", name);
                     // Create a topic with 100 partitions
                     let mut partitions = Vec::with_capacity(100);
                     for i in 0..100 {
                         partitions.push(TopicPartition {
                             partition_id: i,
-                            leader: client.broker_id,
-                            replicas: vec![client.broker_id],
-                            isr: vec![client.broker_id],
+                            leader: state.broker_id,
+                            replicas: vec![state.broker_id],
+                            isr: vec![state.broker_id],
                         });
                     }
-                    client.topics.insert(name.clone(), partitions);
+                    state.topics.insert(name.clone(), partitions);
                     created_topics.insert(name, true);
                 }
             }
@@ -50,10 +64,10 @@ pub(crate) fn handle_metadata(client: &mut ClientState, request: &MetadataReques
     }
 
     // Add topic metadata
-    response.topics = request.topics.as_ref().map_or_else(
+    response.topics = metadata_request.topics.as_ref().map_or_else(
         || {
-            debug!("No topics specified in request, returning all topics: {:?}", client.topics.keys().collect::<Vec<_>>());
-            client.topics.iter().map(|(name, partitions)| create_topic_metadata(name, partitions)).collect()
+            debug!("No topics specified in request, returning all topics: {:?}", state.topics.keys().collect::<Vec<_>>());
+            state.topics.iter().map(|(name, partitions)| create_topic_metadata(name, partitions)).collect()
         },
         |topics| {
             debug!("Topics requested: {:?}", topics.iter().filter_map(|t| t.name.as_ref().map(|n| n.0.to_string())).collect::<Vec<_>>());
@@ -65,7 +79,7 @@ pub(crate) fn handle_metadata(client: &mut ClientState, request: &MetadataReques
                         return None;
                     }
                     
-                    let result = client.topics.get(&name)
+                    let result = state.topics.get(&name)
                         .map(|partitions| create_topic_metadata(&name, partitions));
                     
                     if result.is_none() {
@@ -74,7 +88,7 @@ pub(crate) fn handle_metadata(client: &mut ClientState, request: &MetadataReques
                         if created_topics.contains_key(&name) {
                             info!("Returning newly created topic '{}' in response", name);
                         } else {
-                            debug!("Found topic '{}' with {} partitions", name, client.topics.get(&name).map_or(0, |p| p.len()));
+                            debug!("Found topic '{}' with {} partitions", name, state.topics.get(&name).map_or(0, |p| p.len()));
                         }
                     }
                     
@@ -85,32 +99,36 @@ pub(crate) fn handle_metadata(client: &mut ClientState, request: &MetadataReques
     );
 
     // If we have no topics at all, create a default test_topic
-    if client.topics.is_empty() {
+    if state.topics.is_empty() {
         info!("No topics exist, creating default test_topic");
         let partition = TopicPartition {
             partition_id: 0,
-            leader: client.broker_id,
-            replicas: vec![client.broker_id],
-            isr: vec![client.broker_id],
+            leader: state.broker_id,
+            replicas: vec![state.broker_id],
+            isr: vec![state.broker_id],
         };
-        client.topics.insert("test_topic".to_string(), vec![partition]);
-        
+        state.topics.insert("test_topic".to_string(), vec![partition]);
     }
 
     // Check if we have any topics in the response
     if response.topics.is_empty() {
-        debug!("No topics in response. Client topics: {:?}", client.topics.keys().collect::<Vec<_>>());
+        debug!("No topics in response. Client topics: {:?}", state.topics.keys().collect::<Vec<_>>());
     } else {
         debug!("Response contains {} topics: {:?}", 
                response.topics.len(), 
                response.topics.iter().filter_map(|t| t.name.as_ref().map(|n| n.0.to_string())).collect::<Vec<_>>());
     }
 
-    let response_size = response.compute_size(_api_version)? as i32;
+    let response_size = response.compute_size(api_version)? as i32;
     debug!("Metadata response size: {} bytes", response_size);
     debug!("Metadata response: {:?}", response);
 
-    Ok((ResponseKind::Metadata(response), response_size))
+    Ok(KafkaResponseMessage {
+        request_header: request.header,
+        api_key: request.api_key,
+        response: ResponseKind::Metadata(response),
+        response_size
+    })
 }
 
 fn create_topic_metadata(name: &str, partitions: &[TopicPartition]) -> MetadataResponseTopic {

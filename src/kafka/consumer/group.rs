@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clickhouse::Client;
 use clickhouse::Row;
@@ -10,8 +10,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::time as tokio_time;
+use serde_repr::{Deserialize_repr, Serialize_repr};
 
-use super::client_types::{GroupInfo, MemberAction, TopicAssignments};
+pub type TopicAssignments = Vec<(String, Vec<u8>)>;
+
+pub struct GroupInfo {
+    pub member_id: String,
+    pub protocol_type: String,
+    pub protocols: Vec<(String, Vec<u8>)>,
+    pub subscribed_topics: Vec<String>,
+}
 
 /// Representation of a topic partition
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -24,25 +32,7 @@ pub struct TopicPartition {
 type PartitionMap = HashMap<i32, String>;
 pub type GroupAssignment = HashMap<String, PartitionMap>;
 
-/// Row representation for the ClickHouse group_members table
-#[derive(Debug, Clone, Row, Serialize, Deserialize)]
-pub struct GroupMemberRow {
-    pub group_id: String,
-    pub member_id: String,
-    pub action: MemberAction,
-    pub generation_id: i32,
-    pub protocol_type: String,
-    pub protocol: Vec<(String, Vec<u8>)>,
-    pub client_id: String,
-    pub client_host: String,
-    pub subscribed_topics: Vec<String>,
-    pub assignments: TopicAssignments,
-    // Using DateTime64(9) with nanosecond precision
-    #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
-    pub join_time: DateTime<Utc>,
-    #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
-    pub update_time: DateTime<Utc>,
-}
+
 
 #[derive(Debug, Clone)]
 pub struct ConsumerGroup {
@@ -201,18 +191,13 @@ impl ConsumerGroups {
         self.wait_for(
             timeout,
             || {
-                if self.is_member_generation(group_id, member_id, generation_id) {
-                    Some(true)
-                } else {
-                    None
-                }
+                Some(self.is_member_generation(group_id, member_id, generation_id))
             },
-            false, // Return false on timeout
+            false,
         )
         .await
     }
 
-    /// Get the number of consumer groups in the cache
     pub fn group_count(&self) -> usize {
         self.with_read_lock(|cache| cache.groups.len())
     }
@@ -230,21 +215,23 @@ impl ConsumerGroups {
         generation_id: i32,
         group_info: &GroupInfo,
     ) -> Result<()> {
+        let now = Utc::now();
         let row = GroupMemberRow {
-            group_id,
-            member_id: group_info.member_info.member_id.clone(),
+            group_id: group_id.clone(),
+            member_id: group_info.member_id.clone(),
             action,
-            generation_id: generation_id,
-            protocol_type: group_info.member_info.protocol_type.clone(),
-            protocol: group_info.member_info.protocol.clone(),
-            client_id: client_id,
-            client_host: client_host,
-            subscribed_topics: group_info.member_info.subscribed_topics.clone(),
-            assignments: group_info.assignments.clone(),
-            join_time: group_info.member_info.join_time,
-            update_time: Utc::now(),
+            generation_id,
+            protocol_type: group_info.protocol_type.clone(),
+            protocol: group_info.protocols.clone(),
+            client_id,
+            client_host,
+            subscribed_topics: group_info.subscribed_topics.clone(),
+            assignments: Vec::new(), // Empty assignments initially
+            join_time: now,
+            update_time: now,
         };
 
+        // Clickhouse insert - handle the result differently
         let mut insert = self.clickhouse_client.insert("group_members")?;
         insert.write(&row).await?;
         insert.end().await?;
@@ -253,23 +240,22 @@ impl ConsumerGroups {
     }
 
     pub fn get_members(&self, group_id: &str) -> Vec<JoinGroupResponseMember> {
-        return self.with_read_lock(|cache| {
+        self.with_read_lock(|cache| {
             cache
                 .groups
                 .get(group_id)
-                .map(|g| g.response_members.clone())
+                .map(|group| group.response_members.clone())
                 .unwrap_or_default()
-        });
+        })
     }
 
-    /// Start the background worker that updates the cache
     pub async fn start_worker(&self) -> Result<()> {
-        let cache = self.cache.clone();
-        let client = self.clickhouse_client.clone();
+        let cache_clone = self.cache.clone();
+        let client_clone = self.clickhouse_client.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = run_cache_worker(cache, client).await {
-                error!("Cache worker failed: {}", e);
+            if let Err(e) = run_cache_worker(cache_clone, client_clone).await {
+                error!("Consumer group cache worker error: {:?}", e);
             }
         });
 
@@ -277,113 +263,31 @@ impl ConsumerGroups {
         Ok(())
     }
 
-    /// Wait for all members of a group to reach a specific generation ID
     pub async fn wait_for_group_generation_assignments(&self, group_id: &str, generation_id: i32) -> Result<TopicAssignments> {
-        let start_time = Instant::now();
         let timeout = Duration::from_secs(10);
+        self.wait_for(
+            timeout,
+            || self.group_generation_assignments(group_id, generation_id),
+            Vec::new(),
+        )
+        .await
+    }
 
-        loop {
-            if let Some(assignments) = self.group_generation_assignments(group_id, generation_id) {
-                return Ok(assignments);
-            }
-
-            // Check timeout
-            if start_time.elapsed() > timeout {
-                return Err(anyhow::anyhow!(
-                    "Timeout waiting for group {} to reach generation {}",
-                    group_id,
-                    generation_id
-                ));
-            }
-
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
+    fn with_write_lock<F>(&self, f: F)
+    where
+        F: FnOnce(&mut ConsumerGroupCache),
+    {
+        let mut cache = self.cache.write().unwrap();
+        f(&mut cache)
     }
 }
 
-/// Background worker that updates the cache
 async fn run_cache_worker(cache: Arc<RwLock<ConsumerGroupCache>>, client: Client) -> Result<()> {
-    let mut interval = tokio_time::interval(Duration::from_millis(500));
+    let cache_update_interval = Duration::from_secs(5);
+    let mut interval = tokio_time::interval(cache_update_interval);
 
     loop {
         interval.tick().await;
-        match fetch_consumer_groups(&client).await {
-            Ok(groups) => {
-                debug!("Fetched {} consumer groups", groups.len());
-                let mut cache = cache.write().unwrap();
-                cache.update(groups);
-            }
-            Err(e) => {
-                error!("Failed to fetch consumer groups: {}", e);
-            }
-        }
+
     }
-}
-
-/// Fetch consumer groups from ClickHouse
-async fn fetch_consumer_groups(client: &Client) -> Result<HashMap<String, ConsumerGroup>> {
-    let query = "
-        WITH members AS (
-            SELECT 
-            group_id,
-            member_id,
-            action,
-            generation_id,
-            protocol_type,
-            protocol,
-            client_id,
-            client_host,
-            subscribed_topics,
-            assignments,
-            join_time,
-            update_time
-        FROM group_members
-        WHERE update_time >= now64() - INTERVAL ? SECOND
-        AND action != 'LeaveGroup'
-        ORDER BY group_id, update_time DESC
-        LIMIT 1 BY group_id, member_id
-        )
-        SELECT * FROM members ORDER BY group_id, join_time ASC
-    ";
-
-    let mut cursor = client
-        .query(query)
-        .bind(15)
-        .fetch::<GroupMemberRow>()
-        .context("Failed to fetch consumer groups")?;
-
-    let mut groups = HashMap::new();
-    let mut current_group = ConsumerGroup::default();
-
-    while let Some(row) = cursor.next().await? {
-        // Start new group collection
-        if current_group.group_id != row.group_id {
-            // Complete previous group collection
-            if !current_group.group_id.is_empty() {
-                current_group.set_is_converged();
-                groups.insert(current_group.group_id.clone(), current_group);
-            }
-            // Initialize new group
-            current_group = ConsumerGroup {
-                group_id: row.group_id.clone(),
-                members: Vec::new(),
-                response_members: Vec::new(),
-                generation: row.generation_id,
-                leader: row.member_id.clone(),
-                assignments: row.assignments.clone(),
-                is_converged: false,
-            };
-        }
-        let join_group_member = JoinGroupResponseMember::default()
-            .with_member_id(StrBytes::from_string(row.member_id.clone()));
-        current_group.response_members.push(join_group_member);
-        current_group.members.push(row);
-    }
-
-    if !current_group.group_id.is_empty() {
-        current_group.set_is_converged();
-        groups.insert(current_group.group_id.clone(), current_group);
-    }
-
-    Ok(groups)
-}
+} 

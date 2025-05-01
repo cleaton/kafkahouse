@@ -11,9 +11,9 @@ use ractor::Actor;
 use serde::Serialize;
 use tokio::net::TcpListener;
 
-use crate::kafka::client_actor::Args;
-use crate::kafka::consumer_group::ConsumerGroups;
-use crate::kafka::ClientActor;
+use crate::kafka::client::actor::Args;
+use crate::kafka::consumer::group::ConsumerGroups;
+use crate::kafka::client::ClientActor;
 use super::types::TopicPartitions;
 
 #[derive(Row, Serialize)]
