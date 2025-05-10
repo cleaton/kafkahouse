@@ -10,6 +10,7 @@ use crate::kafka::protocol::KafkaResponseMessage;
 
 pub(crate) async fn handle_api_versions(state: &mut ClientState, request: KafkaRequestMessage) -> Result<KafkaResponseMessage, anyhow::Error> {
     let api_version = request.header.request_api_version;
+    debug!("Handling ApiVersionRequest with correlation_id: {}", request.header.correlation_id);
     
     let mut response = ApiVersionsResponse::default();
     response.error_code = 0;
@@ -26,6 +27,7 @@ pub(crate) async fn handle_api_versions(state: &mut ClientState, request: KafkaR
 
     let response_size = response.compute_size(api_version)? as i32;
     debug!("ApiVersionResponse: {:?}", response);  // Debug the response
+    debug!("Creating response with correlation_id: {}", request.header.correlation_id);
     
     Ok(KafkaResponseMessage {
         request_header: request.header,

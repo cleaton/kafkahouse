@@ -180,70 +180,43 @@ impl Actor for ClientActor {
 
                 // TODO: avoid clone...
                 if let Ok(request) = KafkaRequestMessage::decode(&mut state.read_buffer.clone().freeze()) {
+                    debug!("Received request with correlation_id: {}", request.header.correlation_id);
                     if let Some(client_id) = &request.header.client_id {
                         if state.client_id.is_empty() {
                             state.client_id = client_id.to_string();
                             debug!("Client connected: {} from {}", state.client_id, state.client_host);
                         }
                     }
-                    let _ = myself.send_message(Message::ProcessRequest(request));
-                }
-
-                let _ = myself.send_message(Message::ReadRequest);
-            }
-            
-            Message::ProcessRequest(request) => {
-                // Handle request
-                match process_request(state, request).await {
-                    Ok(response) => {
-                        let _ = myself.send_message(Message::SendResponse(response));
-                    }
-                    Err(e) => {
-                        error!("Error processing request: {:?}", e);
-                    }
-                }
-            }
-            
-            Message::SendResponse(response) => {
-                // Reuse response_buffer
-                state.response_buffer.clear();
-
-                // First write the size placeholder (4 bytes)
-                state.response_buffer.extend_from_slice(&[0; 4]);
-
-                // Encode the response after the size
-                if let Err(e) = response.encode(&mut state.response_buffer) {
-                    error!("Failed to encode response: {:?}", e);
-                    return Ok(());
-                }
-
-                // Calculate and write the actual size (excluding the size bytes themselves)
-                let size = (state.response_buffer.len() - 4) as i32;
-                state.response_buffer[0..4].copy_from_slice(&size.to_be_bytes());
-
-                debug!("Sending response: size={}, total_buffer_len={}", size, state.response_buffer.len());
-
-                // Write everything in one go
-                let mut buffer = &state.response_buffer[..];
-                let result = async {
-                    while !buffer.is_empty() {
-                        match state.tcp_writer.write(buffer).await {
-                            Ok(n) => {
-                                buffer = &buffer[n..];
-                                debug!("Wrote {} bytes, {} remaining", n, buffer.len());
+                    
+                    // Process request immediately
+                    match process_request(state, request).await {
+                        Ok(response) => {
+                            // Send response immediately
+                            if let Err(e) = Self::send_response(state, response).await {
+                                error!("Failed to send response: {:?}", e);
                             }
-                            Err(e) => return Err(e),
+                        }
+                        Err(e) => {
+                            error!("Error processing request: {:?}", e);
                         }
                     }
-                    debug!("Wrote all response bytes");
-                    state.tcp_writer.flush().await?;
-                    debug!("Flushed response");
-                    Ok::<_, std::io::Error>(())
-                }.await;
-
-                if let Err(e) = result {
-                    error!("Failed to write response: {:?}", e);
                 }
+
+                // Continue reading next request
+                if let Err(e) = myself.send_message(Message::ReadRequest) {
+                    error!("Failed to schedule next read: {:?}", e);
+                    return Err(anyhow::anyhow!("Failed to schedule next read: {}", e).into());
+                }
+            }
+            
+            Message::ProcessRequest(_) => {
+                // This message type is no longer used since we process inline
+                debug!("Ignoring ProcessRequest message as we now process inline");
+            }
+            
+            Message::SendResponse(_) => {
+                // This message type is no longer used since we send responses inline
+                debug!("Ignoring SendResponse message as we now send inline");
             }
         }
         
@@ -284,5 +257,38 @@ async fn process_request(state: &mut ClientState, request: KafkaRequestMessage)
         ApiKey::OffsetFetch  => handle_offset_fetch(state, request).await,
         ApiKey::Produce => handle_produce(state, request).await,
         _ => Err(anyhow::anyhow!("Unsupported API key: {}", request.header.request_api_key))
+    }
+}
+
+impl ClientActor {
+    async fn send_response(state: &mut ClientState, response: KafkaResponseMessage) -> Result<(), std::io::Error> {
+        // Reuse response_buffer
+        state.response_buffer.clear();
+
+        // Encode the response
+        if let Err(e) = response.encode(&mut state.response_buffer) {
+            error!("Failed to encode response: {:?}", e);
+            return Ok(());
+        }
+
+        debug!("Sending response: total_buffer_len={}, first_bytes={:?}", 
+            state.response_buffer.len(),
+            &state.response_buffer[..std::cmp::min(20, state.response_buffer.len())]);
+
+        // Write everything in one go
+        let mut buffer = &state.response_buffer[..];
+        while !buffer.is_empty() {
+            match state.tcp_writer.write(buffer).await {
+                Ok(n) => {
+                    buffer = &buffer[n..];
+                    debug!("Wrote {} bytes, {} remaining", n, buffer.len());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        debug!("Wrote all response bytes");
+        state.tcp_writer.flush().await?;
+        debug!("Flushed response");
+        Ok(())
     }
 } 
