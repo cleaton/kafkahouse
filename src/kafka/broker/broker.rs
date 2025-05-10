@@ -265,7 +265,7 @@ impl Broker {
 
         // Prepare batch insert with async settings
         let mut insert = self.clients.get()
-            .insert("consumer_offsets")?
+            .insert("kafka.consumer_offsets")?
             .with_option("async_insert", "1")
             .with_option("wait_for_async_insert", "0");
 
@@ -322,7 +322,7 @@ impl Broker {
                     partition,
                     argMax(offset, commit_time) as offset,
                     argMax(metadata, commit_time) as metadata
-                FROM consumer_offsets
+                FROM kafka.consumer_offsets
                 WHERE group_id = ? 
                     AND commit_time >= now() - INTERVAL 7 DAY
                     AND (topic, partition) IN (
@@ -367,5 +367,79 @@ impl Broker {
         }
 
         Ok(results)
+    }
+
+    pub async fn get_partitions_offsets(
+        &self,
+        topic_partitions: &[(String, Vec<i32>)],
+    ) -> Result<Vec<(String, i32, i64)>, anyhow::Error> { 
+        // Returns (topic, partition, offset)
+        if topic_partitions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Prepare topic and partition arrays with pre-joined format for binding
+        let mut topics = Vec::new();
+        let mut partitions = Vec::new();
+        
+        for (topic, parts) in topic_partitions {
+            for &partition in parts {
+                topics.push(topic.clone());
+                partitions.push(partition);
+            }
+        }
+        
+        // Build query using parameters for security
+        let query = r#"
+            -- Manually create a table of unique topic-partition pairs
+            WITH requested_pairs AS (
+                SELECT 
+                    topic,
+                    partition
+                FROM (
+                    SELECT 
+                        arrayJoin(?) AS topic,
+                        CAST(arrayJoin(?) AS Int32) AS partition
+                    -- Using array index ensures topics and partitions stay aligned
+                    FROM (
+                        SELECT 
+                            number 
+                        FROM 
+                            numbers(1)
+                    )
+                )
+            )
+            -- Query results with left join to ensure all pairs are included
+            SELECT 
+                rp.topic, 
+                rp.partition, 
+                COALESCE(max(km.offset), 0) AS offset
+            FROM 
+                requested_pairs rp
+            LEFT JOIN 
+                kafka.kafka_messages km 
+            ON 
+                km.topic = rp.topic AND 
+                km.partition = rp.partition AND
+                km.ts > now() - INTERVAL 7 DAY
+            GROUP BY 
+                rp.topic, 
+                rp.partition
+            ORDER BY 
+                rp.topic, 
+                rp.partition
+        "#;
+
+        // Execute query with binding for security
+        let rows: Vec<(String, i32, i64)> = self.clients.get()
+            .query(query)
+            .bind(&topics)
+            .bind(&partitions)
+            .fetch_all()
+            .await?;
+
+        info!("Retrieved offsets for {} topic-partitions", rows.len());
+        
+        Ok(rows)
     }
 } 

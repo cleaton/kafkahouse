@@ -6,7 +6,8 @@ use crate::kafka::client::types::ClientState;
 use crate::kafka::consumer::actor::{GroupInfo, MemberAction};
 use log::{debug, info};
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Instant};
+use chrono::Utc;
 
 use crate::kafka::protocol::{KafkaRequestMessage, KafkaResponseMessage};
 
@@ -115,55 +116,74 @@ pub(crate) async fn handle_join_group(state: &mut ClientState, request: KafkaReq
 
     debug!("Member {} subscribed to topics: {:?}", member_id, subscribed_topics);
 
-    // Create group info for the member
-    let group_info = GroupInfo {
-        member_id: member_id.clone(),
-        protocol_type: typed_request.protocol_type.to_string(),
-        protocols,
-        subscribed_topics,
-    };
+    // Get existing group info or create new one
+    let group_info = state.active_groups.entry(group_id.clone())
+        .or_insert_with(|| GroupInfo {
+            member_id: member_id.clone(),
+            protocol_type: typed_request.protocol_type.to_string(),
+            protocols: protocols.clone(),
+            subscribed_topics: subscribed_topics.clone(),
+            last_generation_change: None,
+            join_time: Utc::now(),
+            assignments: Vec::new(),
+        });
 
-    // Write join action to ClickHouse with initial generation 1
+    // Get current generation and leader
+    let (leader, mut generation, last_change) = state.consumer_groups_api
+        .get_group_info(&group_id)
+        .unwrap_or_else(|| (member_id.clone(), 0, Instant::now()));
+
+    // Write join action to ClickHouse
     state.consumer_groups_api.write_action(
         MemberAction::JoinGroup,
         state.client_id.clone(),
         state.client_host.clone(),
         group_id.clone(),
-        1, // Start with generation 1 for new joins
+        generation,
         &group_info,
     ).await?;
 
     // Wait for the member to appear in the cache
     state.consumer_groups_api.wait_join(group_id.clone(), member_id.clone()).await;
 
-    // Get current group info from cache after joining
-    let (leader, generation, _) = state.consumer_groups_api
-        .get_group_info(&group_id)
-        .ok_or_else(|| anyhow::anyhow!("Failed to get group info after join - please retry"))?;
-
-    // Get the group members from cache to build member list
+    // Get the latest group members from cache
     let members = if member_id == leader {
-        // If we're the leader, get all members and their metadata
-        state.consumer_groups_api.get_group_members(&group_id)
-            .map(|members| {
-                members.iter().map(|m| {
-                    // Get the first protocol's metadata for the member
-                    let metadata = m.protocol.first()
-                        .map(|(_, metadata)| metadata.clone())
-                        .unwrap_or_default();
-
-                    JoinGroupResponseMember::default()
-                        .with_member_id(StrBytes::from_string(m.member_id.clone()))
-                        .with_group_instance_id(None)
-                        .with_metadata(metadata.into())
-                }).collect()
+        debug!("Member {} is the leader, fetching all members", member_id);
+        let members = state.consumer_groups_api
+            .get_group_members(&group_id)
+            .unwrap_or_default();
+        
+        debug!("Found {} members in group {}", members.len(), group_id);
+        
+        members.into_iter()
+            .map(|m| {
+                let protocol_metadata = m.protocol.first()
+                    .map(|(_, metadata)| metadata.clone())
+                    .unwrap_or_default();
+                
+                debug!("Adding member {} with {}B metadata", m.member_id, protocol_metadata.len());
+                
+                JoinGroupResponseMember::default()
+                    .with_member_id(StrBytes::from_string(m.member_id))
+                    .with_metadata(protocol_metadata.into())
             })
-            .unwrap_or_default()
+            .collect()
     } else {
-        Vec::new() // Non-leaders get empty member list
+        debug!("Member {} is not the leader, empty member list", member_id);
+        Vec::new()
     };
 
-    // Create the response
+    debug!("JoinGroup response: {} members for {}", members.len(), member_id);
+
+        // If we're the leader and there's been a change since our last generation change,
+    // increment the generation
+    if member_id == leader && group_info.last_generation_change.is_none_or(|i| i != last_change) {
+        generation += 1;
+        group_info.last_generation_change = Some(last_change);
+        debug!("Leader incrementing generation from {} to {}", generation - 1, generation);
+    }
+
+    // Create response
     let response = JoinGroupResponse::default()
         .with_throttle_time_ms(0)
         .with_error_code(0)
@@ -173,13 +193,13 @@ pub(crate) async fn handle_join_group(state: &mut ClientState, request: KafkaReq
         .with_leader(StrBytes::from_string(leader))
         .with_member_id(StrBytes::from_string(member_id))
         .with_members(members)
-        .with_unknown_tagged_fields(BTreeMap::new());  // Required for v5
-    
+        .with_unknown_tagged_fields(BTreeMap::new());
+
     debug!("JoinGroup response: {:?}", response);
-    
+
     // Compute response size
     let response_size = response.compute_size(api_version)? as i32;
-    
+
     Ok(KafkaResponseMessage {
         request_header: request.header,
         api_key: request.api_key,

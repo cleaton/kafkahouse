@@ -24,22 +24,20 @@ pub(crate) async fn handle_sync_group(state: &mut ClientState, request: KafkaReq
     let group_id = typed_request.group_id.to_string();
     let member_id = typed_request.member_id.to_string();
     let generation_id = typed_request.generation_id;
+    let assignments = typed_request.assignments
+        .iter()
+        .map(|a| (a.member_id.to_string(), a.assignment.to_vec()))
+        .collect();
     
     info!("Handling SyncGroup request: group_id={}, member_id={}, generation_id={}",
           group_id, member_id, generation_id);
 
-    // Convert assignments to our internal format
-    let _assignments: Vec<(String, Vec<u8>)> = typed_request.assignments
-        .iter()
-        .map(|a| (a.member_id.to_string(), a.assignment.to_vec()))
-        .collect();
-
-    // Get current group info
-    let group_info = state.active_groups.get(&group_id)
+    let mut group_info = state.active_groups.get(&group_id)
         .ok_or_else(|| anyhow::anyhow!("Group not found"))?
         .clone();
-
-    // Write sync action to ClickHouse
+    group_info.assignments = assignments;
+    state.active_groups.insert(group_id.clone(), group_info.clone());
+    
     state.consumer_groups_api.write_action(
         MemberAction::SyncGroup,
         state.client_id.clone(),
@@ -48,13 +46,12 @@ pub(crate) async fn handle_sync_group(state: &mut ClientState, request: KafkaReq
         generation_id,
         &group_info,
     ).await?;
-
-    // Wait for assignments to be available
+    
     let assignments = state.consumer_groups_api
         .wait_for_group_generation_assignments(&group_id, generation_id)
         .await?;
 
-    // Find this member's assignment
+    info!("Assignments for group {}: {:?}", group_id, assignments.iter().map(|(id, _)| id).collect::<Vec<_>>());
     let my_assignment = assignments
         .iter()
         .find(|(id, _)| id == &member_id)
@@ -62,8 +59,6 @@ pub(crate) async fn handle_sync_group(state: &mut ClientState, request: KafkaReq
         .unwrap_or_default();
 
     let assignment_len = my_assignment.len();
-    
-    // Create the response
     let response = SyncGroupResponse::default()
         .with_throttle_time_ms(0)
         .with_error_code(0)
@@ -72,7 +67,7 @@ pub(crate) async fn handle_sync_group(state: &mut ClientState, request: KafkaReq
         .with_assignment(my_assignment)
         .with_unknown_tagged_fields(BTreeMap::new());
     
-    debug!("SyncGroup response sent to {} with assignment of size {} bytes", member_id, assignment_len);
+    info!("SyncGroup response sent to {} with assignment of size {} bytes", member_id, assignment_len);
     
     // Compute response size
     let response_size = response.compute_size(api_version)? as i32;

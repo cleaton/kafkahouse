@@ -5,6 +5,7 @@ use kafka_protocol::protocol::{Encodable, StrBytes};
 use crate::kafka::client::types::ClientState;
 use crate::kafka::consumer::actor::{GroupInfo, MemberAction};
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use crate::kafka::protocol::{KafkaRequestMessage, KafkaResponseMessage};
 
@@ -33,36 +34,52 @@ pub(crate) async fn handle_leave_group(state: &mut ClientState, request: KafkaRe
         let member_id = member.member_id.to_string();
         info!("Processing leave request for member: {}", member_id);
 
-        // Create new group info for this member
-        let member_group_info = GroupInfo {
-            member_id: member_id.clone(),
-            protocol_type: base_group_info.protocol_type.clone(),
-            protocols: base_group_info.protocols.clone(),
-            subscribed_topics: base_group_info.subscribed_topics.clone(),
-        };
+        // Get existing group info for this member if it exists
+        if let Some(group_info) = state.active_groups.get(&group_id) {
+            if group_info.member_id == member_id {
+                // Get current generation from consumer groups API
+                let (_, generation, _) = state.consumer_groups_api
+                    .get_group_info(&group_id)
+                    .unwrap_or(("".to_string(), 0, Instant::now()));
 
-        // Write leave action to ClickHouse with generation -1 to indicate leaving
-        match state.consumer_groups_api.write_action(
-            MemberAction::LeaveGroup,
-            state.client_id.clone(),
-            state.client_host.clone(),
-            group_id.clone(),
-            -1, // -1 indicates leaving the group
-            &member_group_info,
-        ).await {
-            Ok(_) => {
+                // Write leave action to ClickHouse with current generation
+                match state.consumer_groups_api.write_action(
+                    MemberAction::LeaveGroup,
+                    state.client_id.clone(),
+                    state.client_host.clone(),
+                    group_id.clone(),
+                    generation,
+                    group_info,
+                ).await {
+                    Ok(_) => {
+                        // Remove from active groups
+                        state.active_groups.remove(&group_id);
+                        member_responses.push(leave_group_response::MemberResponse::default()
+                            .with_member_id(StrBytes::from_string(member_id))
+                            .with_group_instance_id(member.group_instance_id)
+                            .with_error_code(0)); // 0 = success
+                    }
+                    Err(e) => {
+                        error!("Failed to process leave for member {}: {}", member_id, e);
+                        member_responses.push(leave_group_response::MemberResponse::default()
+                            .with_member_id(StrBytes::from_string(member_id))
+                            .with_group_instance_id(member.group_instance_id)
+                            .with_error_code(1)); // 1 = error
+                    }
+                }
+            } else {
+                // Member not found in active groups but still respond with success
                 member_responses.push(leave_group_response::MemberResponse::default()
                     .with_member_id(StrBytes::from_string(member_id))
                     .with_group_instance_id(member.group_instance_id)
-                    .with_error_code(0)); // 0 = success
+                    .with_error_code(0));
             }
-            Err(e) => {
-                error!("Failed to process leave for member {}: {}", member_id, e);
-                member_responses.push(leave_group_response::MemberResponse::default()
-                    .with_member_id(StrBytes::from_string(member_id))
-                    .with_group_instance_id(member.group_instance_id)
-                    .with_error_code(1)); // 1 = error
-            }
+        } else {
+            // Group not found but still respond with success
+            member_responses.push(leave_group_response::MemberResponse::default()
+                .with_member_id(StrBytes::from_string(member_id))
+                .with_group_instance_id(member.group_instance_id)
+                .with_error_code(0));
         }
     }
 

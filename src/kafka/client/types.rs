@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::BytesMut;
 use kafka_protocol::messages::api_versions_response::ApiVersion;
@@ -36,7 +37,7 @@ pub struct ClientState {
     
     // Active consumer groups
     pub active_groups: HashMap<String, GroupInfo>, // group_id -> group_info
-    
+
     // Committed offsets
     pub committed_offsets: HashMap<String, HashMap<String, HashMap<i32, i64>>>, // group_id -> (topic -> (partition -> offset))
     

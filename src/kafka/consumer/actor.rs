@@ -6,6 +6,7 @@ use clickhouse::Row;
 use anyhow::anyhow;
 use log::debug;
 use log::error;
+use log::info;
 use ractor::RpcReplyPort;
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,8 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
 use std::time::Instant;
+use kafka_protocol::messages::join_group_response::JoinGroupResponseMember;
+use kafka_protocol::protocol::StrBytes;
 
 struct ConsumerGroupsActor;
 
@@ -55,12 +58,16 @@ pub struct GroupInfo {
     pub protocol_type: String,
     pub protocols: Vec<(String, Vec<u8>)>,
     pub subscribed_topics: Vec<String>,
+    pub join_time: DateTime<Utc>,
+    pub assignments: Vec<(String, Vec<u8>)>,
+    pub last_generation_change: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ConsumerGroup {
     pub group_id: String,
     pub members: Vec<GroupMemberRow>,
+    pub response_members: Vec<JoinGroupResponseMember>,
     pub last_change: Instant,
     pub generation: i32,
     pub leader: String,
@@ -83,6 +90,7 @@ impl Default for ConsumerGroup {
         ConsumerGroup {
             group_id: String::new(),
             members: Vec::new(),
+            response_members: Vec::new(),
             generation: 0,
             last_change: Instant::now(),
             leader: String::new(),
@@ -137,6 +145,10 @@ impl ConsumerGroupsApi {
         generation_id: i32,
         group_info: &GroupInfo,
     ) -> Result<(), Error> {
+        let group_id_clone = group_id.clone();
+        debug!("Writing action={:?} for member={} in group={} with {} assignments", 
+               action, group_info.member_id, group_id_clone, group_info.assignments.len());
+               
         let mut insert = self.clickhouse_client
             .insert("kafka.group_members")?
             .with_option("async_insert", "1")
@@ -153,12 +165,14 @@ impl ConsumerGroupsApi {
             client_id,
             client_host,
             subscribed_topics: group_info.subscribed_topics.clone(),
-            assignments: Vec::new(), // Empty for now, will be updated in sync
-            join_time: Utc::now(),
+            assignments: group_info.assignments.clone(), // Use assignments from GroupInfo
+            join_time: group_info.join_time,
             update_time: Utc::now(),
         }).await?;
 
         insert.end().await?;
+        debug!("Successfully wrote action for member={} in group={} with assignments", 
+               group_info.member_id, group_id_clone);
         Ok(())
     }
 
@@ -206,6 +220,11 @@ impl ConsumerGroupsApi {
         // Wait for the generation to converge
         self.wait_generation(group_id.to_string(), generation).await?;
         
+
+        self.cache.read().unwrap().iter().for_each(|g| {
+            info!("GROUP {}, {}", g.0, g.1.members.len());
+        });
+
         // Get assignments from cache
         let assignments = self.cache
             .read()
@@ -215,6 +234,13 @@ impl ConsumerGroupsApi {
             .assignments
             .clone();
             
+        // Log the assignments for debugging
+        debug!("Retrieved {} assignments for group {} generation {}", 
+               assignments.len(), group_id, generation);
+        for (member_id, data) in &assignments {
+            debug!("Assignment for {}: {} bytes", member_id, data.len());
+        }
+        
         Ok(assignments)
     }
 }
@@ -243,9 +269,9 @@ pub struct GroupMemberRow {
     pub client_host: String,
     pub subscribed_topics: Vec<String>,
     pub assignments: TopicAssignments,
-    #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
     pub join_time: DateTime<Utc>,
-    #[serde(with = "clickhouse::serde::chrono::datetime64::nanos")]
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
     pub update_time: DateTime<Utc>,
 }
 
@@ -259,6 +285,7 @@ struct ConsumerOffsetRow {
     member_id: String,
     client_id: String,
     client_host: String,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
     commit_time: DateTime<Utc>,
 }
 
@@ -327,9 +354,12 @@ impl Actor for ConsumerGroupsActor {
 
     async fn pre_start(
         &self,
-        _myself: ActorRef<Self::Msg>,
+        myself: ActorRef<Self::Msg>,
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
+
+        myself.send_interval(Duration::from_secs(1), || Message::UpdateConsumerGroupCache);
+
         Ok(State {
             clickhouse_client: args.0,
             consumer_groups: args.1,
@@ -387,67 +417,96 @@ impl Actor for ConsumerGroupsActor {
 
 impl State {
     async fn update_consumer_groups(&mut self) -> Result<()> {
+        debug!("Updating consumer group cache...");
+
         let query = r#"
-        WITH latest_actions AS (
-            SELECT
+        WITH members AS (
+            SELECT 
                 group_id,
                 member_id,
-                argMax(action, update_time) as action,
-                argMax(generation_id, update_time) as generation_id,
-                argMax(protocol_type, update_time) as protocol_type,
-                argMax(protocol, update_time) as protocol,
-                argMax(client_id, update_time) as client_id,
-                argMax(client_host, update_time) as client_host,
-                argMax(subscribed_topics, update_time) as subscribed_topics,
-                argMax(assignments, update_time) as assignments,
-                min(join_time) as join_time,
-                max(update_time) as update_time
-            FROM group_members WHERE update_time >= now() - interval 30 second
-            GROUP BY group_id, member_id
+                action,
+                generation_id,
+                protocol_type,
+                protocol,
+                client_id,
+                client_host,
+                subscribed_topics,
+                assignments,
+                join_time,
+                update_time
+            FROM kafka.group_members
+            WHERE update_time >= now64() - INTERVAL ? SECOND
+            AND action != 'LeaveGroup'
+            ORDER BY group_id, update_time DESC
+            LIMIT 1 BY group_id, member_id
         )
-        SELECT
-            group_id,
-            member_id,
-            action,
-            generation_id,
-            protocol_type,
-            protocol,
-            client_id,
-            client_host,
-            subscribed_topics,
-            assignments,
-            join_time,
-            update_time
-        FROM latest_actions
-        WHERE action != 'LeaveGroup'
-        ORDER BY group_id, join_time
+        SELECT * FROM members ORDER BY group_id, join_time ASC
         "#;
 
-        let rows: Vec<GroupMemberRow> = self.clickhouse_client.query(query).fetch_all().await?;
-        let mut groups: HashMap<String, Vec<GroupMemberRow>> = HashMap::new();
-        for row in rows {
-            groups.entry(row.group_id.clone()).or_default().push(row);
-        }
-        let mut consumer_groups = self.consumer_groups.write().unwrap();
-        consumer_groups
-            .retain(|group_id, _| groups.contains_key(group_id));
-        for (group_id, members) in groups {
-            let current_group = consumer_groups.entry(group_id.clone()).or_default();
+        let mut cursor = self.clickhouse_client
+            .query(query)
+            .bind(15)
+            .fetch::<GroupMemberRow>()?;
 
-            // Check if any member differs at same index
-            let has_changes = current_group.members.len() != members.len()
-                || current_group
-                    .members
-                    .iter()
-                    .zip(members.iter())
-                    .any(|(current, new)| current.member_id != new.member_id);
+        let mut groups = HashMap::new();
+        let mut current_group = ConsumerGroup::default();
 
-            if has_changes {
-                current_group.last_change = Instant::now();
+        while let Some(row) = cursor.next().await? {
+            // Start new group collection
+            if current_group.group_id != row.group_id {
+                // Complete previous group collection
+                if !current_group.group_id.is_empty() {
+                    current_group.set_is_converged();
+                    debug!("Saved group {} with {} members, {} assignments", 
+                           current_group.group_id, current_group.members.len(), 
+                           current_group.assignments.len());
+                    groups.insert(current_group.group_id.clone(), current_group);
+                }
+                // Initialize new group
+                current_group = ConsumerGroup {
+                    group_id: row.group_id.clone(),
+                    members: Vec::new(),
+                    response_members: Vec::new(),
+                    generation: row.generation_id,
+                    last_change: Instant::now(),
+                    leader: row.member_id.clone(),
+                    assignments: row.assignments.clone(),
+                    is_converged: false,
+                };
+                
+                debug!("Started new group collection for {}, leader: {}, with {} assignments", 
+                       row.group_id, row.member_id, row.assignments.len());
             }
-            current_group.members = members;
-            current_group.set_is_converged();
+
+            // Add member to current group
+            let join_group_member = JoinGroupResponseMember::default()
+                .with_member_id(StrBytes::from_string(row.member_id.clone()))
+                .with_metadata(row.protocol.first().map(|p| p.1.clone()).unwrap_or_default().into());
+            current_group.response_members.push(join_group_member);
+            current_group.members.push(row.clone());
         }
+
+        if !current_group.group_id.is_empty() {
+            current_group.set_is_converged();
+            debug!("Saved final group {} with {} members, {} assignments", 
+                   current_group.group_id, current_group.members.len(), 
+                   current_group.assignments.len());
+            groups.insert(current_group.group_id.clone(), current_group);
+        }
+
+        // Update the shared cache
+        let mut consumer_groups = self.consumer_groups.write().unwrap();
+        *consumer_groups = groups;
+
+        // Print assignments for each group
+        for (group_id, group) in consumer_groups.iter() {
+            info!("Group {} assignments:", group_id);
+            for (member_id, assignment) in &group.assignments {
+                info!("  Member {}: {} bytes", member_id, assignment.len());
+            }
+        }
+
+        debug!("Updated consumer group cache with {} groups", consumer_groups.len());
         Ok(())
     }
 }
