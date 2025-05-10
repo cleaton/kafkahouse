@@ -4,7 +4,6 @@ use anyhow;
 use bytes::BytesMut;
 use kafka_protocol::messages::*;
 use kafka_protocol::messages::api_versions_response::ApiVersion;
-use kafka_protocol::protocol::Encodable;
 use log::{debug, error};
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -122,11 +121,9 @@ impl Actor for ClientActor {
             |peer| peer.ip().to_string() + ":" + &peer.port().to_string()
         );
         
-        let consumer_group_cache = args.broker.consumer_group_cache();
-        
         // Create initialized state
         let state = ClientState {
-            broker: args.broker,
+            broker: args.broker.clone(),
             broker_id: 0,
             cluster_id: "test-cluster".to_string(),
             controller_id: Some(0),
@@ -136,11 +133,12 @@ impl Actor for ClientActor {
             tcp_writer,
             topics: std::collections::HashMap::new(),
             joined_groups: std::collections::HashMap::new(),
-            consumer_group_cache,
             committed_offsets: std::collections::HashMap::new(),
             supported_api_versions: init_api_versions(),
             read_buffer: BytesMut::with_capacity(4096),
             response_buffer: BytesMut::with_capacity(4096),
+            consumer_groups_api: args.broker.get_consumer_groups_api(),
+            active_groups: std::collections::HashMap::new(),
         };
         
         // Begin reading from TCP stream
@@ -170,15 +168,18 @@ impl Actor for ClientActor {
                     }
                 };
 
-                let mut buf = BytesMut::with_capacity(message_size as usize);
-                buf.resize(message_size as usize, 0);
+                // Reuse read_buffer, clear and ensure capacity
+                state.read_buffer.clear();
+                state.read_buffer.reserve(message_size as usize);
+                state.read_buffer.resize(message_size as usize, 0);
 
-                if let Err(e) = state.tcp_reader.read_exact(&mut buf).await {
+                if let Err(e) = state.tcp_reader.read_exact(&mut state.read_buffer).await {
                     error!("Error reading message body: {:?}", e);
                     return Ok(());
                 }
 
-                if let Ok(request) = KafkaRequestMessage::decode(&mut buf.freeze()) {
+                // TODO: avoid clone...
+                if let Ok(request) = KafkaRequestMessage::decode(&mut state.read_buffer.clone().freeze()) {
                     if let Some(client_id) = &request.header.client_id {
                         if state.client_id.is_empty() {
                             state.client_id = client_id.to_string();
@@ -204,16 +205,39 @@ impl Actor for ClientActor {
             }
             
             Message::SendResponse(response) => {
-                let mut buf = BytesMut::new();
-                if let Err(e) = response.encode(&mut buf) {
+                // Reuse response_buffer
+                state.response_buffer.clear();
+
+                // First write the size placeholder (4 bytes)
+                state.response_buffer.extend_from_slice(&[0; 4]);
+
+                // Encode the response after the size
+                if let Err(e) = response.encode(&mut state.response_buffer) {
                     error!("Failed to encode response: {:?}", e);
                     return Ok(());
                 }
 
+                // Calculate and write the actual size (excluding the size bytes themselves)
+                let size = (state.response_buffer.len() - 4) as i32;
+                state.response_buffer[0..4].copy_from_slice(&size.to_be_bytes());
+
+                debug!("Sending response: size={}, total_buffer_len={}", size, state.response_buffer.len());
+
+                // Write everything in one go
+                let mut buffer = &state.response_buffer[..];
                 let result = async {
-                    state.tcp_writer.write_i32(buf.len() as i32).await?;
-                    state.tcp_writer.write_all(&buf).await?;
+                    while !buffer.is_empty() {
+                        match state.tcp_writer.write(buffer).await {
+                            Ok(n) => {
+                                buffer = &buffer[n..];
+                                debug!("Wrote {} bytes, {} remaining", n, buffer.len());
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    debug!("Wrote all response bytes");
                     state.tcp_writer.flush().await?;
+                    debug!("Flushed response");
                     Ok::<_, std::io::Error>(())
                 }.await;
 

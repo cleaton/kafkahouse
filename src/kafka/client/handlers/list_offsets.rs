@@ -6,7 +6,7 @@ use log::debug;
 
 use crate::kafka::protocol::{KafkaRequestMessage, KafkaResponseMessage};
 
-pub(crate) async fn handle_list_offsets(state: &mut ClientState, request: KafkaRequestMessage) 
+pub(crate) async fn handle_list_offsets(_state: &mut ClientState, request: KafkaRequestMessage) 
     -> Result<KafkaResponseMessage, anyhow::Error> {
     
     let api_version = request.header.request_api_version;

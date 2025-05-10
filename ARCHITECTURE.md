@@ -126,12 +126,11 @@ CREATE TABLE consumer_offsets ON CLUSTER '{cluster}' (
     member_id String,
     client_id String,
     client_host String,
-    commit_time DateTime64(3) DEFAULT now64(),
-    PRIMARY KEY (group_id, topic, partition)
+    commit_time DateTime64(9) DEFAULT now64()
 )
 ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/consumer_offsets', '{replica}')
 PARTITION BY toYYYYMMDD(toStartOfInterval(commit_time, INTERVAL 1 WEEK))
-ORDER BY (group_id, topic, partition)
+ORDER BY (group_id, topic, partition, commit_time)
 TTL commit_time + INTERVAL 8 WEEK;
 ```
 
@@ -188,22 +187,6 @@ This approach provides:
 - High throughput by optimizing data locality
 - High availability by allowing writes to continue on remaining replicas if one ClickHouse server is down
 - Data consistency through partition ownership
-
-```
-┌─────────────────────────────────────────┐   ┌─────────────────────────────────────────┐
-│                                         │   │                                         │
-│  ClickHouse Server 1                    │   │  ClickHouse Server 2                    │
-│                                         │   │                                         │
-│  ┌─────────────┐    ┌───────────────┐   │   │  ┌─────────────┐    ┌───────────────┐   │
-│  │             │    │               │   │   │  │             │    │               │   │
-│  │ Partitions  │    │ Committed     │   │   │  │ Partitions  │    │ Committed     │   │
-│  │ 0-49        │    │ Offsets for   │   │   │  │ 50-99       │    │ Offsets for   │   │
-│  │             │    │ Partitions    │   │   │  │             │    │ Partitions    │   │
-│  │             │    │ 0-49          │   │   │  │             │    │ 50-99         │   │
-│  └─────────────┘    └───────────────┘   │   │  └─────────────┘    └───────────────┘   │
-│                                         │   │                                         │
-└─────────────────────────────────────────┘   └─────────────────────────────────────────┘
-```
 
 ### Consumer Group Protocol Flow
 
@@ -296,37 +279,3 @@ Consumer                    Broker                   ClickHouse
 6. **Monitoring and Diagnostics**:
    - Create views for monitoring consumer progress and lag
    - Implement diagnostic queries for troubleshooting
-
-## Monitoring Consumer Progress
-
-We can create views to monitor consumer progress and lag:
-
-```sql
-CREATE VIEW consumer_lag ON CLUSTER '{cluster}' AS
-SELECT
-    co.group_id,
-    co.topic,
-    co.partition,
-    co.offset AS committed_offset,
-    (SELECT max(offset) FROM kafka_messages WHERE topic = co.topic AND partition = co.partition) AS latest_offset,
-    (SELECT max(offset) FROM kafka_messages WHERE topic = co.topic AND partition = co.partition) - co.offset AS lag,
-    co.commit_time
-FROM consumer_offsets co;
-```
-
-This view will show:
-- The latest committed offset for each consumer group
-- The latest available offset for each topic-partition
-- The lag between the two (how far behind a consumer is)
-- When the offset was last committed
-
-## Conclusion
-
-This architecture provides a robust foundation for implementing consumer groups in the Kafka ClickHouse Broker. By leveraging ClickHouse for both message storage and consumer group metadata, we can achieve:
-
-1. High throughput for producers and consumers
-2. High availability through ClickHouse replication
-3. Scalability by adding more ClickHouse servers
-4. Simplified operations by using ClickHouse for all storage needs
-
-The implementation prioritizes data locality and availability, while providing the full consumer group functionality expected from a Kafka broker. The shared cache worker design ensures all broker instances have a consistent view of consumer group state while minimizing database load.

@@ -1,6 +1,50 @@
-# Kafka ClickHouse Broker
+# Kafka CH
 
-A Kafka broker implementation that stores messages in ClickHouse.
+A Kafka-compatible broker implementation that uses ClickHouse for storage.
+
+## Project Structure
+
+```
+src/
+├── main.rs              # Application entry point
+├── kafka/               # Kafka implementation
+│   ├── mod.rs           # Module exports
+│   ├── broker/          # Broker implementation
+│   │   ├── mod.rs
+│   │   ├── broker.rs    # Core broker implementation
+│   │   └── types.rs     # Broker-specific types
+│   ├── client/          # Client handling
+│   │   ├── mod.rs
+│   │   ├── actor.rs     # Client connection actor
+│   │   ├── types.rs     # Client-related types
+│   │   └── handlers/    # Protocol handlers
+│   │       ├── mod.rs
+│   │       ├── api_versions.rs
+│   │       ├── metadata.rs
+│   │       └── ...      # Other protocol handlers
+│   ├── consumer/        # Consumer group implementation
+│   │   ├── mod.rs
+│   │   ├── group.rs     # Consumer group management
+│   │   └── actor.rs     # Consumer group actor
+│   └── protocol.rs      # Kafka protocol handling
+└── storage/             # Storage implementation
+```
+
+## Development Status
+
+This project is in early development. The broker can currently:
+- Accept Kafka client connections
+- Handle producer requests and store messages in ClickHouse
+- Support consumer group coordination
+- Process fetch requests to read data
+
+## Running the Project
+
+```
+cargo run
+```
+
+The broker listens on port 9092 by default.
 
 ## Prerequisites
 

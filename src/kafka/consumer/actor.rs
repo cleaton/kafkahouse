@@ -1,27 +1,55 @@
-use clickhouse::Row;
+use anyhow::Error;
+use anyhow::Result;
+use chrono::{DateTime, Utc};
 use clickhouse::Client;
-use kafka_protocol::protocol::StrBytes;
+use clickhouse::Row;
+use anyhow::anyhow;
+use log::debug;
+use log::error;
+use ractor::RpcReplyPort;
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
-use chrono::{DateTime, Utc};
-use anyhow::Result;
-use kafka_protocol::messages::join_group_response::JoinGroupResponseMember;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
-
+use std::sync::Arc;
+use std::sync::RwLock;
+use std::time::Duration;
+use std::time::Instant;
 
 struct ConsumerGroupsActor;
 
+struct WaitForGeneration {
+    group_id: String,
+    generation: i32,
+    reply: RpcReplyPort<()>,
+}
+
+struct WaitForJoin {
+    group_id: String,
+    member_id: String,
+    reply: RpcReplyPort<()>,
+}
+
+pub struct GroupLeader {
+    member_id: String,
+    generation: i32,
+    last_change: Instant,
+}
+
 struct State {
-    clickhouse_client: Client
+    clickhouse_client: Client,
+    consumer_groups: Arc<RwLock<HashMap<String, ConsumerGroup>>>,
+    wait_for_generation: Vec<WaitForGeneration>,
+    wait_for_join: Vec<WaitForJoin>,
 }
 
 enum Message {
-    UpdateConsumerGroupCache
+    UpdateConsumerGroupCache,
+    WaitForGeneration(String, i32, RpcReplyPort<()>),
+    WaitForJoin(String, String, RpcReplyPort<()>),
 }
 
+#[derive(Clone)]
 pub struct GroupInfo {
     pub member_id: String,
     pub protocol_type: String,
@@ -33,7 +61,7 @@ pub struct GroupInfo {
 pub struct ConsumerGroup {
     pub group_id: String,
     pub members: Vec<GroupMemberRow>,
-    pub response_members: Vec<JoinGroupResponseMember>,
+    pub last_change: Instant,
     pub generation: i32,
     pub leader: String,
     pub assignments: TopicAssignments,
@@ -56,53 +84,50 @@ impl Default for ConsumerGroup {
             group_id: String::new(),
             members: Vec::new(),
             generation: 0,
+            last_change: Instant::now(),
             leader: String::new(),
             assignments: Vec::new(),
-            response_members: Vec::new(),
             is_converged: false,
         }
     }
 }
 
-#[derive(Debug, Clone)]
-struct ConsumerGroupCache {
-    groups: HashMap<String, ConsumerGroup>,
-    last_updated: Instant,
-}
-
-impl Default for ConsumerGroupCache {
-    fn default() -> Self {
-        Self {
-            groups: HashMap::new(),
-            last_updated: Instant::now(),
-        }
-    }
-}
-
-impl ConsumerGroupCache {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn update(&mut self, new_groups: HashMap<String, ConsumerGroup>) {
-        self.groups = new_groups;
-        self.last_updated = Instant::now();
-    }
-}
-
-struct ConsumerGroups {
+pub struct ConsumerGroupsApi {
     clickhouse_client: Client,
-    cache: Arc<RwLock<ConsumerGroupCache>>
+    actor: ActorRef<Message>,
+    cache: Arc<RwLock<HashMap<String, ConsumerGroup>>>,
 }
 
+impl ConsumerGroupsApi {
+    pub async fn new(clickhouse_client: Client) -> Self {
+        let cache = Arc::new(RwLock::new(HashMap::new()));
+        let (actor, _handle) = Actor::spawn(None, ConsumerGroupsActor, (clickhouse_client.clone(), cache.clone()))
+        .await
+        .expect("ConsumerGroup Cache actor");
+        Self { clickhouse_client, actor, cache }
+    }
 
-impl ConsumerGroups {
-    pub fn new(clickhouse_client: Client) -> Self {
-        Self {
-            clickhouse_client,
-            cache: ConsumerGroupCache::default()
+    pub fn get_group_info(&self, group_id: &str) -> Option<(String, i32, Instant)> {
+        self.cache
+            .read()
+            .unwrap()
+            .get(group_id)
+            .map(|group| (group.leader.clone(), group.generation, group.last_change))
+    }
+
+    pub async fn wait_join(&self, group_id: String, member_id: String) {
+        let _ = self.actor.call(|reply| Message::WaitForJoin(group_id, member_id, reply), Some(Duration::from_secs(10))).await;
+    }
+
+    pub async fn wait_generation(&self, group_id: String, generation: i32) -> Result<()> {
+        let resp = self.actor.call(|reply| Message::WaitForGeneration(group_id, generation, reply), Some(Duration::from_secs(10))).await?;
+        match resp {
+            ractor::rpc::CallResult::Success(_) => Ok(()),
+            ractor::rpc::CallResult::Timeout => Err(anyhow!("timeout")),
+            ractor::rpc::CallResult::SenderError => Err(anyhow!("sender error")),
         }
     }
+
     pub async fn write_action(
         &self,
         action: MemberAction,
@@ -111,10 +136,15 @@ impl ConsumerGroups {
         group_id: String,
         generation_id: i32,
         group_info: &GroupInfo,
-    ) -> Result<()> {
-        let now = Utc::now();
-        let row = GroupMemberRow {
-            group_id: group_id.clone(),
+    ) -> Result<(), Error> {
+        let mut insert = self.clickhouse_client
+            .insert("kafka.group_members")?
+            .with_option("async_insert", "1")
+            .with_option("wait_for_async_insert", "0");
+
+        // Write member action
+        insert.write(&GroupMemberRow {
+            group_id,
             member_id: group_info.member_id.clone(),
             action,
             generation_id,
@@ -123,16 +153,69 @@ impl ConsumerGroups {
             client_id,
             client_host,
             subscribed_topics: group_info.subscribed_topics.clone(),
-            assignments: Vec::new(),
-            join_time: now,
-            update_time: now,
-        };
+            assignments: Vec::new(), // Empty for now, will be updated in sync
+            join_time: Utc::now(),
+            update_time: Utc::now(),
+        }).await?;
 
-        let mut insert = self.clickhouse_client.insert("group_members")?;
-        insert.write(&row).await?;
         insert.end().await?;
-
         Ok(())
+    }
+
+    pub async fn write_offset_commit(
+        &self,
+        group_id: String,
+        topic: String,
+        partition: i32,
+        offset: i64,
+        metadata: String,
+        member_id: String,
+        client_id: String,
+        client_host: String,
+    ) -> Result<(), Error> {
+        let mut insert = self.clickhouse_client
+            .insert("kafka.consumer_offsets")?
+            .with_option("async_insert", "1")
+            .with_option("wait_for_async_insert", "0");
+        
+        insert.write(&ConsumerOffsetRow {
+            group_id,
+            topic,
+            partition,
+            offset,
+            metadata,
+            member_id,
+            client_id,
+            client_host,
+            commit_time: Utc::now(),
+        }).await?;
+
+        insert.end().await?;
+        Ok(())
+    }
+
+    pub fn get_group_members(&self, group_id: &str) -> Option<Vec<GroupMemberRow>> {
+        self.cache
+            .read()
+            .unwrap()
+            .get(group_id)
+            .map(|group| group.members.clone())
+    }
+
+    pub async fn wait_for_group_generation_assignments(&self, group_id: &str, generation: i32) -> Result<Vec<(String, Vec<u8>)>> {
+        // Wait for the generation to converge
+        self.wait_generation(group_id.to_string(), generation).await?;
+        
+        // Get assignments from cache
+        let assignments = self.cache
+            .read()
+            .unwrap()
+            .get(group_id)
+            .ok_or_else(|| anyhow!("Group not found"))?
+            .assignments
+            .clone();
+            
+        Ok(assignments)
     }
 }
 
@@ -166,61 +249,145 @@ pub struct GroupMemberRow {
     pub update_time: DateTime<Utc>,
 }
 
+#[derive(Row, Serialize)]
+struct ConsumerOffsetRow {
+    group_id: String,
+    topic: String,
+    partition: i32,
+    offset: i64,
+    metadata: String,
+    member_id: String,
+    client_id: String,
+    client_host: String,
+    commit_time: DateTime<Utc>,
+}
+
+impl ConsumerGroupsActor {
+    async fn handle_update_cache(state: &mut State) {
+        debug!("Updating consumer group cache...");
+
+        
+
+        if let Err(e) = state.update_consumer_groups().await {
+            error!("Failed to fetch consumer groups: {:?}", e);
+            return;
+        }
+
+        let consumer_groups = state.consumer_groups.read().unwrap();
+
+        state.wait_for_generation = state
+            .wait_for_generation
+            .drain(..)
+            .filter_map(|w| {
+                if w.reply.is_closed() {
+                    return Some(w);
+                }
+
+                let group = consumer_groups.get(&w.group_id)?;
+                if group.is_converged && group.generation == w.generation {
+                    let _ = w.reply.send(());
+                    None
+                } else {
+                    Some(w)
+                }
+            })
+            .collect();
+
+        state.wait_for_join = state
+            .wait_for_join
+            .drain(..)
+            .filter_map(|w| {
+                if w.reply.is_closed() {
+                    return Some(w);
+                }
+
+                let group = consumer_groups.get(&w.group_id)?;
+                if group.members.iter().any(|m| m.member_id == w.member_id) {
+                    let _ = w.reply.send(());
+                    None
+                } else {
+                    Some(w)
+                }
+            })
+            .collect();
+
+        debug!(
+            "Updated consumer group cache with {} groups",
+            consumer_groups.len()
+        );
+    }
+}
 
 impl Actor for ConsumerGroupsActor {
     type Msg = Message;
     // and (optionally) internal state
     type State = State;
     // Startup initialization args
-    type Arguments = Client;
-    
+    type Arguments = (Client, Arc<RwLock<HashMap<String, ConsumerGroup>>>);
+
     async fn pre_start(
         &self,
         _myself: ActorRef<Self::Msg>,
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        Ok(State { clickhouse_client: args })
+        Ok(State {
+            clickhouse_client: args.0,
+            consumer_groups: args.1,
+            wait_for_generation: Vec::new(),
+            wait_for_join: Vec::new(),
+        })
     }
 
     async fn handle(
-            &self,
-            _myself: ActorRef<Self::Msg>,
-            message: Self::Msg,
-            _state: &mut Self::State,
-        ) -> Result<(), ActorProcessingErr> {
-            match message {
-                Message::UpdateConsumerGroupCache => {
-                    debug!("Updating consumer group cache...");
-                    match fetch_consumer_groups(&client).await {
-                        Ok(groups) => {
-                            let count = groups.len();
-                            let mut cache = cache.write().unwrap();
-                            cache.update(groups);
-                            debug!("Updated consumer group cache with {} groups", count);
-                        }
-                        Err(e) => {
-                            error!("Failed to fetch consumer groups: {:?}", e);
-                        }
+        &self,
+        _myself: ActorRef<Self::Msg>,
+        message: Self::Msg,
+        state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        match message {
+            Message::UpdateConsumerGroupCache => Self::handle_update_cache(state).await,
+            Message::WaitForGeneration(group_id, generation, reply) => {
+                if let Some(group) = state.consumer_groups.read().unwrap().get(&group_id) {
+                    if group.is_converged && group.generation == generation {
+                        let _ = reply.send(());
+                        return Ok(());
                     }
                 }
+                state.wait_for_generation.push(WaitForGeneration {
+                    group_id,
+                    generation,
+                    reply,
+                });
             }
+            Message::WaitForJoin(group_id, member_id, reply) => {
+                if let Some(group) = state.consumer_groups.read().unwrap().get(&group_id) {
+                    if group.members.iter().any(|m| m.member_id == member_id) {
+                        let _ = reply.send(());
+                        return Ok(());
+                    }
+                }
+                state.wait_for_join.push(WaitForJoin {
+                    group_id,
+                    member_id,
+                    reply,
+                });
+            }
+        }
         Ok(())
     }
 
     async fn post_stop(
-            &self,
-            _myself: ActorRef<Self::Msg>,
-            _state: &mut Self::State,
-        ) -> Result<(), ActorProcessingErr> {
+        &self,
+        _myself: ActorRef<Self::Msg>,
+        _state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
         Ok(())
     }
 }
 
-
-
-
-async fn fetch_consumer_groups(client: &Client) -> Result<HashMap<String, ConsumerGroup>> {
-    let query = r#"
+impl State {
+    async fn update_consumer_groups(&mut self) -> Result<()> {
+        let query = r#"
         WITH latest_actions AS (
             SELECT
                 group_id,
@@ -235,7 +402,7 @@ async fn fetch_consumer_groups(client: &Client) -> Result<HashMap<String, Consum
                 argMax(assignments, update_time) as assignments,
                 min(join_time) as join_time,
                 max(update_time) as update_time
-            FROM group_members
+            FROM group_members WHERE update_time >= now() - interval 30 second
             GROUP BY group_id, member_id
         )
         SELECT
@@ -254,51 +421,33 @@ async fn fetch_consumer_groups(client: &Client) -> Result<HashMap<String, Consum
         FROM latest_actions
         WHERE action != 'LeaveGroup'
         ORDER BY group_id, join_time
-    "#;
+        "#;
 
-    let rows: Vec<GroupMemberRow> = client.query(query).fetch_all().await?;
-
-    let mut groups = HashMap::new();
-    for row in rows {
-        let group_id = row.group_id.clone();
-        let group = groups.entry(group_id).or_insert_with(ConsumerGroup::default);
-        
-        // Set group info from first member (or highest gen)
-        if group.generation < row.generation_id || group.group_id.is_empty() {
-            group.group_id = row.group_id.clone();
-            group.generation = row.generation_id;
+        let rows: Vec<GroupMemberRow> = self.clickhouse_client.query(query).fetch_all().await?;
+        let mut groups: HashMap<String, Vec<GroupMemberRow>> = HashMap::new();
+        for row in rows {
+            groups.entry(row.group_id.clone()).or_default().push(row);
         }
-        
-        // Add member
-        group.members.push(row.clone());
-        
-        // Find leader - the one with the earliest join time in the current generation
-        if row.generation_id == group.generation {
-            if group.leader.is_empty() || row.join_time < 
-                group.members.iter()
-                    .find(|m| m.member_id == group.leader)
-                    .map(|m| m.join_time)
-                    .unwrap_or_else(|| Utc::now()) {
-                group.leader = row.member_id.clone();
+        let mut consumer_groups = self.consumer_groups.write().unwrap();
+        consumer_groups
+            .retain(|group_id, _| groups.contains_key(group_id));
+        for (group_id, members) in groups {
+            let current_group = consumer_groups.entry(group_id.clone()).or_default();
+
+            // Check if any member differs at same index
+            let has_changes = current_group.members.len() != members.len()
+                || current_group
+                    .members
+                    .iter()
+                    .zip(members.iter())
+                    .any(|(current, new)| current.member_id != new.member_id);
+
+            if has_changes {
+                current_group.last_change = Instant::now();
             }
+            current_group.members = members;
+            current_group.set_is_converged();
         }
-        
-        // Create join group response member format
-        let response_member = JoinGroupResponseMember::default()
-            .with_member_id(StrBytes::from_string(row.member_id.clone()))
-            .with_metadata(Vec::new().into()); // Empty metadata for now
-            
-        group.response_members.push(response_member);
+        Ok(())
     }
-    
-    // Process all groups to set assignments and converged status
-    for group in groups.values_mut() {
-        if let Some(leader_member) = group.members.iter().find(|m| m.member_id == group.leader) {
-            group.assignments = leader_member.assignments.clone();
-        }
-        
-        group.set_is_converged();
-    }
-
-    Ok(groups)
 }

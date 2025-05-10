@@ -6,7 +6,7 @@ use kafka_protocol::messages::api_versions_response::ApiVersion;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::kafka::broker::Broker;
-use crate::kafka::consumer::group::ConsumerGroups;
+use crate::kafka::consumer::actor::{ConsumerGroupsApi, GroupInfo};
 
 #[derive(Debug, Clone)]
 pub struct TopicPartition {
@@ -34,8 +34,8 @@ pub struct ClientState {
     // Group membership
     pub joined_groups: JoinedGroups,
     
-    // Consumer group cache
-    pub consumer_group_cache: Arc<ConsumerGroups>,
+    // Active consumer groups
+    pub active_groups: HashMap<String, GroupInfo>, // group_id -> group_info
     
     // Committed offsets
     pub committed_offsets: HashMap<String, HashMap<String, HashMap<i32, i64>>>, // group_id -> (topic -> (partition -> offset))
@@ -46,4 +46,7 @@ pub struct ClientState {
     // Message buffers
     pub read_buffer: BytesMut,
     pub response_buffer: BytesMut,
+
+    // Consumer groups API
+    pub consumer_groups_api: Arc<ConsumerGroupsApi>,
 } 
