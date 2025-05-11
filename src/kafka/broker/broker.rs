@@ -8,7 +8,7 @@ use clickhouse::{Client, Row};
 use kafka_protocol::records::{RecordBatchDecoder, Compression};
 use log::{info, debug, error};
 use ractor::Actor;
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 use tokio::net::TcpListener;
 use chrono::Utc;
 
@@ -24,17 +24,18 @@ struct KafkaMessageInsert {
     value: String,
 }
 
-#[derive(Row, Serialize)]
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
 struct ConsumerOffsetInsert {
-    group_id: String,
-    topic: String,
-    partition: i32,
-    offset: i64,
-    metadata: String,
-    member_id: String,
-    client_id: String,
-    client_host: String,
-    commit_time: chrono::DateTime<Utc>,
+    pub group_id: String,
+    pub topic: String,
+    pub partition: i32,
+    pub offset: i64,
+    pub metadata: String,
+    pub member_id: String,
+    pub client_id: String,
+    pub client_host: String,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub commit_time: chrono::DateTime<Utc>,
 }
 
 struct ClickHouseClients {
@@ -46,9 +47,7 @@ impl ClickHouseClients {
     fn new(urls: &str) -> Self {
         let clients = urls.split(',')
             .map(|url| Client::default()
-                .with_url(url.trim())
-                .with_option("async_insert", "1")
-                .with_option("wait_for_async_insert", "1"))
+                .with_url(url.trim()))
             .collect();
         Self { 
             clients,
@@ -104,7 +103,10 @@ impl Broker {
     }
 
     pub async fn produce(&self, mut req: ProduceRequest) -> Result<ProduceResponse, anyhow::Error> {
-        let mut insert = self.clients.get().insert("kafka.kafka_messages_ingest")?;
+        let mut insert = self.clients.get()
+            .insert("kafka.kafka_messages_ingest")?
+            .with_option("async_insert", "1")
+            .with_option("wait_for_async_insert", "0");
         let mut message_count = 0;
         
         // Process all topics and partitions
@@ -197,7 +199,7 @@ impl Broker {
         }
         
         query.push_str(&conditions.join(" OR "));
-        query.push_str(" ORDER BY topic, partition, offset LIMIT 5000"); // Limit to prevent huge responses
+        query.push_str(" ORDER BY topic, partition, offset ASC LIMIT 100 BY topic, partition LIMIT 5000"); // Limit to prevent huge responses
         
         debug!("Executing ClickHouse query: {}", query);
         
@@ -218,40 +220,6 @@ impl Broker {
         Ok(result)
     }
 
-    pub async fn get_latest_offset(&self, topic: &str, partition: i32) -> Result<i64, anyhow::Error> {
-        let query = "SELECT max(offset) as max_offset FROM kafka.kafka_messages WHERE topic = ? AND partition = ?";
-        let result: Option<i64> = self.clients.get().query(query)
-            .bind(topic)
-            .bind(partition)
-            .fetch_optional()
-            .await?;
-        
-        Ok(result.unwrap_or(0))
-    }
-
-    pub async fn get_earliest_offset(&self, topic: &str, partition: i32) -> Result<i64, anyhow::Error> {
-        let query = "SELECT min(offset) as min_offset FROM kafka.kafka_messages WHERE topic = ? AND partition = ?";
-        let result: Option<i64> = self.clients.get().query(query)
-            .bind(topic)
-            .bind(partition)
-            .fetch_optional()
-            .await?;
-        
-        Ok(result.unwrap_or(0))
-    }
-
-    pub async fn get_offset_at_time(&self, topic: &str, partition: i32, timestamp: i64) -> Result<i64, anyhow::Error> {
-        let query = "SELECT min(offset) as offset FROM kafka.kafka_messages WHERE topic = ? AND partition = ? AND ts >= fromUnixTimestamp64Milli(?)";
-        let result: Option<i64> = self.clients.get().query(query)
-            .bind(topic)
-            .bind(partition)
-            .bind(timestamp)
-            .fetch_optional()
-            .await?;
-        
-        Ok(result.unwrap_or(0))
-    }
-
     pub async fn commit_offsets(
         &self,
         group_id: String,
@@ -263,14 +231,19 @@ impl Broker {
         let mut results = Vec::new();
         let now = Utc::now();
 
-        // Prepare batch insert with async settings
-        let mut insert = self.clients.get()
-            .insert("kafka.consumer_offsets")?
-            .with_option("async_insert", "1")
-            .with_option("wait_for_async_insert", "0");
+        info!("Committing offsets for group_id={}, member_id={}, client_id={}, offsets.len={}",
+              group_id, member_id, client_id, offsets.len());
 
-        // Process each offset
+        // Process each offset individually instead of batch
         for (topic, partition, offset, metadata) in offsets {
+            debug!("Inserting offset: topic={}, partition={}, offset={}", topic, partition, offset);
+            
+            // Create insert for just one row with async settings
+            let mut insert = self.clients.get()
+                .insert("kafka.consumer_offsets")?
+                .with_option("async_insert", "1")
+                .with_option("wait_for_async_insert", "0");
+            
             // Insert into ClickHouse
             let row = ConsumerOffsetInsert {
                 group_id: group_id.clone(),
@@ -284,86 +257,106 @@ impl Broker {
                 commit_time: now,
             };
 
-            if let Err(e) = insert.write(&row).await {
-                error!("Failed to write offset commit: {}", e);
-                results.push((topic, partition, 1)); // Error code 1 for general errors
-                continue;
-            }
-
-            results.push((topic, partition, 0)); // Success
-        }
-
-        // Commit the batch
-        if let Err(e) = insert.end().await {
-            error!("Failed to commit offset batch: {}", e);
-            // Mark all remaining offsets as failed
-            for result in results.iter_mut() {
-                if result.2 == 0 {
-                    result.2 = 1;
+            match insert.write(&row).await {
+                Ok(_) => {
+                    // Commit this single insert
+                    match insert.end().await {
+                        Ok(_) => {
+                            debug!("Successfully committed offset for topic={}, partition={}, offset={}", 
+                                  topic, partition, offset);
+                            results.push((topic, partition, 0)); // Success
+                        },
+                        Err(e) => {
+                            error!("Failed to commit offset for topic={}, partition={}: {}", 
+                                  topic, partition, e);
+                            results.push((topic, partition, 1)); // Error code 1 for general errors
+                        }
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to write offset commit for topic={}, partition={}: {}", 
+                          topic, partition, e);
+                    results.push((topic, partition, 1)); // Error code 1 for general errors
                 }
             }
+        }
+
+        info!("Completed offset commits: {} successful, {} failed", 
+             results.iter().filter(|r| r.2 == 0).count(),
+             results.iter().filter(|r| r.2 != 0).count());
+
+        Ok(results)
+    }
+
+    pub async fn list_offsets(
+        &self,
+        topics: &[(String, Vec<i32>)], // (topic, partition_indexes)
+    ) -> Result<Vec<(String, i32, i64)>, anyhow::Error> { // Returns (topic, partition, offset)
+        let mut results = Vec::new();
+        
+        // Transform topics into format suitable for IN clause: [(topic, partition), ...]
+        let mut topic_partition_pairs = Vec::new();
+        for (topic, partitions) in topics {
+            for &partition in partitions {
+                topic_partition_pairs.push((topic.clone(), partition));
+            }
+        }
+        
+        // Build query to get latest offsets for each topic-partition
+        let query = r#"
+            SELECT topic, partition, max(offset) as offset FROM kafka.kafka_messages
+            WHERE (topic, partition) IN ? AND ts > now() - interval 7 day
+            GROUP BY topic, partition
+        "#;
+
+        // Execute query
+        let rows = self.clients.get()
+            .query(query)
+            .bind(&topic_partition_pairs)
+            .fetch_all()
+            .await?;
+
+        for (topic, partition, offset) in rows {
+            results.push((topic, partition, offset));
         }
 
         Ok(results)
     }
 
-    pub async fn fetch_offsets(
+    pub async fn offset_fetch(
         &self,
-        group_id: &str,
+        group_id: String,
         topics: &[(String, Vec<i32>)], // (topic, partition_indexes)
-    ) -> Result<Vec<(String, i32, i64, String)>, anyhow::Error> { // Returns (topic, partition, offset, metadata)
+    ) -> Result<Vec<(String, i32, i64)>, anyhow::Error> { // Returns (topic, partition, offset)
         let mut results = Vec::new();
+        
+        // Transform topics into format suitable for IN clause: [(topic, partition), ...]
+        let mut topic_partition_pairs = Vec::new();
+        for (topic, partitions) in topics {
+            for &partition in partitions {
+                topic_partition_pairs.push((topic.clone(), partition));
+            }
+        }
         
         // Build query to get latest offsets for each topic-partition
         let query = r#"
-            WITH latest_offsets AS (
-                SELECT
-                    topic,
-                    partition,
-                    argMax(offset, commit_time) as offset,
-                    argMax(metadata, commit_time) as metadata
-                FROM kafka.consumer_offsets
-                WHERE group_id = ? 
-                    AND commit_time >= now() - INTERVAL 7 DAY
-                    AND (topic, partition) IN (
-                        SELECT topic, partition
-                        FROM (
-                            SELECT arrayJoin(?) as topic, arrayJoin(?) as partition
-                        )
-                    )
-                GROUP BY topic, partition
-            )
-            SELECT
-                topic,
-                partition,
-                offset,
-                metadata
-            FROM latest_offsets
-            ORDER BY topic, partition
+            SELECT topic, partition, offset FROM kafka.consumer_offsets
+            WHERE group_id = ?
+            AND (topic, partition) IN ?
+            ORDER BY group_id, topic, partition, commit_time DESC
+            LIMIT 1 BY group_id, topic, partition
         "#;
-
-        // Prepare parameters
-        let mut topic_names = Vec::new();
-        let mut partition_ids = Vec::new();
-        
-        for (topic, partitions) in topics {
-            for &partition in partitions {
-                topic_names.push(topic.clone());
-                partition_ids.push(partition);
-            }
-        }
 
         // Execute query
         let rows = self.clients.get()
             .query(query)
-            .bind(group_id)
-            .bind(&topic_names)
-            .bind(&partition_ids)
+            .bind(&group_id)
+            .bind(&topic_partition_pairs)
             .fetch_all()
             .await?;
 
-        for (topic, partition, offset, metadata) in rows {
-            results.push((topic, partition, offset, metadata));
+        for (topic, partition, offset) in rows {
+            results.push((topic, partition, offset));
         }
 
         Ok(results)

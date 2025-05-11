@@ -33,12 +33,6 @@ struct WaitForJoin {
     reply: RpcReplyPort<()>,
 }
 
-pub struct GroupLeader {
-    member_id: String,
-    generation: i32,
-    last_change: Instant,
-}
-
 struct State {
     clickhouse_client: Client,
     consumer_groups: Arc<RwLock<HashMap<String, ConsumerGroup>>>,
@@ -450,6 +444,18 @@ impl State {
 
         let mut groups = HashMap::new();
         let mut current_group = ConsumerGroup::default();
+        
+        // Capture existing group member IDs before we start processing
+        let existing_groups_snapshot = {
+            let existing_groups = self.consumer_groups.read().unwrap();
+            // Create a map of group_id -> set of member_ids
+            existing_groups.iter().map(|(group_id, group)| {
+                let member_ids: Vec<String> = group.members.iter()
+                    .map(|m| m.member_id.clone())
+                    .collect();
+                (group_id.clone(), (member_ids, group.last_change))
+            }).collect::<HashMap<String, (Vec<String>, Instant)>>()
+        };
 
         while let Some(row) = cursor.next().await? {
             // Start new group collection
@@ -462,13 +468,14 @@ impl State {
                            current_group.assignments.len());
                     groups.insert(current_group.group_id.clone(), current_group);
                 }
-                // Initialize new group
-                current_group = ConsumerGroup {
+                
+                // Initialize new group with default last_change
+                let new_group = ConsumerGroup {
                     group_id: row.group_id.clone(),
                     members: Vec::new(),
                     response_members: Vec::new(),
                     generation: row.generation_id,
-                    last_change: Instant::now(),
+                    last_change: Instant::now(), // Default to new timestamp
                     leader: row.member_id.clone(),
                     assignments: row.assignments.clone(),
                     is_converged: false,
@@ -476,6 +483,8 @@ impl State {
                 
                 debug!("Started new group collection for {}, leader: {}, with {} assignments", 
                        row.group_id, row.member_id, row.assignments.len());
+                       
+                current_group = new_group;
             }
 
             // Add member to current group
@@ -486,12 +495,55 @@ impl State {
             current_group.members.push(row.clone());
         }
 
+        // Process the last group if any
         if !current_group.group_id.is_empty() {
             current_group.set_is_converged();
             debug!("Saved final group {} with {} members, {} assignments", 
                    current_group.group_id, current_group.members.len(), 
                    current_group.assignments.len());
             groups.insert(current_group.group_id.clone(), current_group);
+        }
+
+        // Now check for membership changes and update last_change accordingly
+        for (group_id, group) in &mut groups {
+            // If this group existed before, check if membership changed
+            if let Some((old_member_ids, old_last_change)) = existing_groups_snapshot.get(group_id) {
+                // Get current member IDs
+                let new_member_ids: Vec<String> = group.members.iter()
+                    .map(|m| m.member_id.clone())
+                    .collect();
+                
+                // Check if the member lists are different
+                let old_members_set = old_member_ids.iter().cloned().collect::<std::collections::HashSet<String>>();
+                let new_members_set = new_member_ids.iter().cloned().collect::<std::collections::HashSet<String>>();
+                
+                // Find added and removed members for detailed logging
+                let added_members: Vec<_> = new_members_set.difference(&old_members_set).collect();
+                let removed_members: Vec<_> = old_members_set.difference(&new_members_set).collect();
+                
+                let members_changed = old_members_set.len() != new_members_set.len() || 
+                                     !old_members_set.is_subset(&new_members_set) ||
+                                     !new_members_set.is_subset(&old_members_set);
+                
+                if members_changed {
+                    info!("Membership changed for group {}, updating last_change", group_id);
+                    if !added_members.is_empty() {
+                        info!("New members joined group {}: {:?}", group_id, added_members);
+                    }
+                    if !removed_members.is_empty() {
+                        info!("Members left group {}: {:?}", group_id, removed_members);
+                    }
+                    // Membership changed, use new timestamp
+                    group.last_change = Instant::now();
+                } else {
+                    info!("Membership unchanged for group {}, keeping original last_change", group_id);
+                    // Membership didn't change, keep old timestamp
+                    group.last_change = *old_last_change;
+                }
+            } else {
+                // New group, already has a new timestamp
+                debug!("New group {} with new last_change", group_id);
+            }
         }
 
         // Update the shared cache

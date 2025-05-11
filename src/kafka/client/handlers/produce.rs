@@ -1,7 +1,7 @@
 use anyhow::Result;
 use kafka_protocol::messages::*;
 use kafka_protocol::protocol::Encodable;
-use log::info;
+use log::debug;
 
 use crate::kafka::client::types::ClientState;
 use crate::kafka::protocol::{KafkaRequestMessage, KafkaResponseMessage};
@@ -18,7 +18,7 @@ pub(crate) async fn handle_produce(state: &mut ClientState, request: KafkaReques
         return Err(anyhow::anyhow!("Expected Produce request"));
     };
     
-    info!("Handling Produce request: {:?}", produce_request);
+    debug!("Handling Produce request: {:?}", produce_request);
 
     // Use the broker to handle the actual produce operation
     let produce_response = state.broker.produce(produce_request).await?;

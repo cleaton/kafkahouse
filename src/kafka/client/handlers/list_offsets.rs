@@ -3,8 +3,7 @@ use kafka_protocol::messages::*;
 use kafka_protocol::messages::list_offsets_response::{ListOffsetsPartitionResponse, ListOffsetsResponse, ListOffsetsTopicResponse};
 use kafka_protocol::protocol::Encodable;
 use crate::kafka::client::types::ClientState;
-use log::{debug, info};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use crate::kafka::protocol::{KafkaRequestMessage, KafkaResponseMessage};
 
@@ -19,96 +18,67 @@ pub(crate) async fn handle_list_offsets(state: &mut ClientState, request: KafkaR
     } else {
         return Err(anyhow::anyhow!("Expected ListOffsets request"));
     };
-    
-    info!("Handling ListOffsets request for {} topics", typed_request.topics.len());
-    
-    // Extract topic-partition pairs from request
-    let topic_partitions: Vec<(String, Vec<i32>)> = typed_request.topics
-        .iter()
-        .map(|topic| {
-            let topic_name = topic.name.to_string();
-            let partitions = topic.partitions.iter()
-                .map(|p| p.partition_index)
-                .collect();
-            (topic_name, partitions)
-        })
-        .collect();
-    
-    // Get all partition offsets in a single query
-    let partition_offsets = state.broker.get_partitions_offsets(&topic_partitions).await?;
-    
-    // Create a map for easy lookup: topic -> partition -> offset
-    let mut offset_map: HashMap<String, HashMap<i32, i64>> = HashMap::new();
-    for (topic, partition, offset) in partition_offsets {
-        offset_map
-            .entry(topic)
-            .or_insert_with(HashMap::new)
-            .insert(partition, offset);
-    }
-    
-    // Build the response
-    let mut response_topics = Vec::new();
-    
-    for topic_request in &typed_request.topics {
-        let topic_name = topic_request.name.to_string();
-        let mut partitions = Vec::new();
-        
-        // Process each requested partition
-        for partition_request in &topic_request.partitions {
-            let partition_id = partition_request.partition_index;
-            
-            // Get offset for this partition (default to 0 if not found)
-            let offset = offset_map
-                .get(&topic_name)
-                .and_then(|partitions| partitions.get(&partition_id))
-                .copied()
-                .unwrap_or(0);
-            
-            // Handle different timestamp specifications
-            let response_offset = match partition_request.timestamp {
-                -1 => offset,         // Latest offset
-                -2 => 0,              // Earliest offset (we're assuming 0 for all partitions)
-                _ => 0,               // Timestamp-based offset (not fully implemented)
-            };
-            
-            let error_code = if response_offset == 0 && partition_request.timestamp == -1 {
-                // Check if partition exists in topic metadata
-                let partition_exists = state.topics
-                    .get(&topic_name)
-                    .map(|partitions| partitions.iter().any(|p| p.partition_id == partition_id))
-                    .unwrap_or(false);
-                
-                if !partition_exists {
-                    3 // UNKNOWN_TOPIC_OR_PARTITION
-                } else {
-                    0 // SUCCESS
-                }
-            } else {
-                0 // SUCCESS
-            };
-            
-            let partition_response = ListOffsetsPartitionResponse::default()
-            .with_partition_index(partition_id)
-            .with_error_code(error_code)
-            .with_timestamp(partition_request.timestamp)
-            .with_offset(response_offset)
-            .with_leader_epoch(-1);
-            
-            partitions.push(partition_response);
+
+    // Collect topics and partitions to query
+    let mut topics_partitions = Vec::new();
+    for topic in &typed_request.topics {
+        let mut partition_ids = Vec::new();
+        for partition in &topic.partitions {
+            partition_ids.push(partition.partition_index);
         }
         
-        // Add topic to response
-        let topic_response = ListOffsetsTopicResponse::default()
-            .with_name(topic_request.name.clone())
-            .with_partitions(partitions);
-            
-        response_topics.push(topic_response);
+        if !partition_ids.is_empty() {
+            topics_partitions.push((topic.name.to_string(), partition_ids));
+        }
     }
     
-    // Build the final response
+    // Get the latest offsets from the broker
+    let offsets = state.broker.list_offsets(&topics_partitions).await?;
+    
+    // Build the response
+    let mut topic_responses = Vec::new();
+    let mut topic_offsets_map: HashMap<String, Vec<(i32, i64)>> = HashMap::new();
+    
+    // Organize offsets by topic
+    for (topic, partition, offset) in offsets {
+        topic_offsets_map
+            .entry(topic)
+            .or_insert_with(Vec::new)
+            .push((partition, offset));
+    }
+    
+    // Create response for each topic in the request
+    for topic in &typed_request.topics {
+        let topic_name = topic.name.to_string();
+        let mut partition_responses = Vec::new();
+        
+        for partition_req in &topic.partitions {
+            let partition_id = partition_req.partition_index;
+            let offset = topic_offsets_map
+                .get(&topic_name)
+                .and_then(|partitions| partitions.iter().find(|(p, _)| *p == partition_id))
+                .map(|(_, o)| *o)
+                .unwrap_or(0); // Default to 0 if offset not found
+            
+            let partition_response = ListOffsetsPartitionResponse::default()
+                .with_partition_index(partition_id)
+                .with_error_code(0) // Success
+                .with_timestamp(partition_req.timestamp) // Echo back the timestamp
+                .with_offset(offset);
+                
+            partition_responses.push(partition_response);
+        }
+        
+        let topic_response = ListOffsetsTopicResponse::default()
+            .with_name(topic.name.clone())
+            .with_partitions(partition_responses);
+            
+        topic_responses.push(topic_response);
+    }
+    
     let response = ListOffsetsResponse::default()
-        .with_throttle_time_ms(0)
-        .with_topics(response_topics);
+        .with_topics(topic_responses)
+        .with_throttle_time_ms(0);
     
     let response_size = response.compute_size(api_version)? as i32;
     

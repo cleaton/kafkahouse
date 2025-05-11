@@ -3,7 +3,7 @@ use kafka_protocol::messages::*;
 use kafka_protocol::protocol::{Encodable, StrBytes};
 use crate::kafka::client::types::ClientState;
 use crate::kafka::consumer::actor::MemberAction;
-use log::{debug, info};
+use log::info;
 use std::collections::BTreeMap;
 use bytes::Bytes;
 

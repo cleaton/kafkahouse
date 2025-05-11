@@ -20,23 +20,18 @@ pub(crate) async fn handle_metadata(state: &mut ClientState, request: KafkaReque
         return Err(anyhow::anyhow!("Expected Metadata request"));
     };
     
-    debug!("Handling metadata request: {:?}", metadata_request);
+    debug!("Handling metadata request: api_version={}, {:?}", api_version, metadata_request);
     
+    // Create a minimal response based on your previous working code
     let mut response = MetadataResponse::default();
     
-    // Add broker information
+    // Add broker information - minimal fields that work across versions
     response.brokers = vec![
         MetadataResponseBroker::default()
             .with_node_id(BrokerId(state.broker_id))
             .with_host(StrBytes::from_string("127.0.0.1".to_string()))
             .with_port(9092)
-            .with_rack(None)
     ];
-
-    // Set cluster information
-    response.cluster_id = Some(StrBytes::from_string(state.cluster_id.to_string()));
-    response.controller_id = BrokerId(state.controller_id.unwrap_or(-1));
-    response.throttle_time_ms = 0;
 
     // Auto-create topics if they don't exist
     let mut created_topics = HashMap::new();
@@ -67,7 +62,8 @@ pub(crate) async fn handle_metadata(state: &mut ClientState, request: KafkaReque
     response.topics = metadata_request.topics.as_ref().map_or_else(
         || {
             debug!("No topics specified in request, returning all topics: {:?}", state.topics.keys().collect::<Vec<_>>());
-            state.topics.iter().map(|(name, partitions)| create_topic_metadata(name, partitions)).collect()
+            state.topics.iter().map(|(name, partitions)| 
+                create_topic_metadata(name, partitions)).collect()
         },
         |topics| {
             debug!("Topics requested: {:?}", topics.iter().filter_map(|t| t.name.as_ref().map(|n| n.0.to_string())).collect::<Vec<_>>());
@@ -141,8 +137,7 @@ fn create_topic_metadata(name: &str, partitions: &[TopicPartition]) -> MetadataR
                 .with_replica_nodes(p.replicas.iter().map(|&id| BrokerId(id)).collect())
                 .with_isr_nodes(p.isr.iter().map(|&id| BrokerId(id)).collect())
         }).collect())
-        .with_error_code(0)
-        .with_is_internal(false);
+        .with_error_code(0);
     
     debug!("Created topic metadata for '{}' with {} partitions", name, partitions.len());
     topic_metadata

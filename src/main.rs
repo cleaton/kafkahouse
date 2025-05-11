@@ -9,7 +9,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     info!("Starting Kafka broker with storage interface");
-    let clickhouse_url = std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".to_string());
+    let clickhouse_url = std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123,http://localhost:8124".to_string());
     let listen_host = std::env::var("LISTEN_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let listen_port = std::env::var("LISTEN_PORT")
         .unwrap_or_else(|_| "9092".to_string())

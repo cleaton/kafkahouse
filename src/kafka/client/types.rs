@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use bytes::BytesMut;
 use kafka_protocol::messages::api_versions_response::ApiVersion;

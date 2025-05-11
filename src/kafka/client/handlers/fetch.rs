@@ -8,7 +8,7 @@ use kafka_protocol::{
     protocol::{Encodable, StrBytes},
     records::{Record, RecordBatchEncoder, RecordEncodeOptions, Compression, TimestampType},
 };
-use log::{error, info};
+use log::{debug, error};
 use std::{
     collections::HashMap,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -35,7 +35,7 @@ pub async fn handle_fetch(
         return Err(anyhow::anyhow!("Expected Fetch request"));
     };
 
-    info!(
+    debug!(
         "Handling Fetch request: max_bytes={}, min_bytes={}, max_wait_ms={}",
         request.max_bytes, request.min_bytes, request.max_wait_ms
     );
@@ -233,23 +233,38 @@ pub async fn handle_fetch(
 
     // Log the number of records returned
     let mut total_records = 0;
-    let elapsed_ms = if !topic_partitions.is_empty() {
+    let mut elapsed_ms = if !topic_partitions.is_empty() {
         response.throttle_time_ms
     } else {
         0
     };
 
+    // Count records and check if we're returning any data
+    let mut has_data = false;
     for topic_response in &response.responses {
         for partition in &topic_response.partitions {
             if let Some(records_bytes) = &partition.records {
                 // We don't have an easy way to count records in the encoded bytes,
                 // so we'll estimate based on size
-                total_records += records_bytes.len() / 100; // Rough estimate
+                let record_count = records_bytes.len() / 100; // Rough estimate
+                total_records += record_count;
+                
+                if record_count > 0 {
+                    has_data = true;
+                }
             }
         }
     }
+    
+    // If we have no data to return, set a minimum throttle time of 1000ms
+    // This helps reduce polling frequency from clients when there's no data
+    if !has_data && elapsed_ms < 1000 {
+        elapsed_ms = 1000;
+        response = response.with_throttle_time_ms(elapsed_ms);
+        debug!("No data returned, setting minimum throttle time to 1000ms");
+    }
 
-    info!(
+    debug!(
         "Fetch response returning approximately {} records in {} bytes (waited {}ms)",
         total_records, response_size, elapsed_ms
     );
