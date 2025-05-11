@@ -23,4 +23,4 @@ pub(crate) use sync_group::handle_sync_group;
 pub(crate) use heartbeat::handle_heartbeat;
 pub(crate) use leave_group::handle_leave_group;
 pub(crate) use offset_commit::handle_offset_commit;
-pub(crate) use offset_fetch::handle_offset_fetch;
+pub(crate) use offset_fetch::handle_offset_fetch; 

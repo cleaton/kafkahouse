@@ -29,6 +29,7 @@ impl KafkaRequestMessage {
         }
         let header_version = api_key.request_header_version(api_version);
         let header = RequestHeader::decode(data, header_version).unwrap();
+        debug!("Decoded request header with correlation_id: {}", header.correlation_id);
         debug!("Decoding request with API key: {:?}", api_key);
         debug!("Data length: {:?}", data.len());
         debug!("Data: {:?}", data);
@@ -46,12 +47,16 @@ pub struct KafkaResponseMessage {
     pub response: ResponseKind,
     pub response_size: i32,
 }
+
 impl KafkaResponseMessage {
     pub fn encode(&self, buffer: &mut BytesMut) -> Result<(), anyhow::Error> {
         let api_version = self.request_header.request_api_version;
+        debug!("Encoding response for correlation_id: {}", self.request_header.correlation_id);
+        
         // Encode response header first
         let response_header = ResponseHeader::default()
             .with_correlation_id(self.request_header.correlation_id);
+        debug!("Created response header with correlation_id: {}", response_header.correlation_id);
 
         let response_header_version = self.api_key.response_header_version(api_version);
         let header_size = response_header.compute_size(response_header_version)? as i32;
